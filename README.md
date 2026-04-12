@@ -1,6 +1,6 @@
 # Customer 360 — ELT Pipeline
 
-> End-to-end ELT pipeline that ingests JSON logs from an on-premises SQL Server, lands them into Azure Data Lake, and transforms them through the Medallion Architecture (Raw → Bronze → Silver → Gold) — delivering production-ready KPIs to Power BI via PySpark and dbt.
+> End-to-end ELT pipeline that reads JSON logs exported from Elasticsearch, lands them into Azure Data Lake, and transforms them through the Medallion Architecture (Raw → Bronze → Silver → Gold) — delivering production-ready KPIs to Power BI via PySpark and dbt on Azure Synapse Analytics Serverless.
 
 ---
 
@@ -25,12 +25,12 @@
 | Item | Detail |
 |---|---|
 | **Purpose** | Ingest, cleanse, and transform ~300K–600K daily JSON log records into business KPIs |
-| **Source** | On-premises SQL Server → Elasticsearch JSON exports (30 files/day) |
+| **Source** | JSON files exported from Elasticsearch — available locally as 30 files/day (~10K–20K records/file) |
 | **Scale** | ~10K–20K records per file; incremental + full reload modes |
 | **Output** | Gold layer KPIs → Power BI dashboards |
 | **Design** | Incremental, idempotent ELT pipeline |
-| **Dev Environment** | Docker (PostgreSQL + Airflow) |
-| **Prod Environment** | Azure SQL Database + Azure Blob / Data Lake Gen2 |
+| **Dev Environment** | Docker (Spark + PostgreSQL + Airflow) on local machine |
+| **Prod Environment** | Azure (ADLS Gen2 + Azure Synapse Analytics Serverless SQL) |
 
 ---
 
@@ -38,160 +38,183 @@
 
 ### Design Rationale
 
-Every layer exists for a specific reason. The choices below reflect established data engineering principles applied to this workload.
+**ADLS Gen2 for Raw, Bronze, and Silver. Synapse Serverless SQL for Gold only. PySpark for Bronze and Silver transformations. dbt for Gold. Airflow for orchestration only.**
 
-| Principle | How This Project Applies It |
-|---|---|
-| **Data Lake and Data Warehouse separation** | Raw layer lives in Azure Blob / Data Lake Gen2 — schema-on-read, append-only, immutable. Structured layers (Bronze → Silver → Gold) live in the data warehouse (PostgreSQL / Azure SQL), where schema is enforced and transformations are queryable and auditable. |
-| **Separation of concerns** | Blob handles immutable raw files; the database handles structured storage, business logic, and serving. Orchestration (Airflow / ADF) is decoupled from processing (PySpark) so teams can evolve each layer independently. |
-| **Scalability** | PySpark distributes processing across partitions; ADF + Airflow scale orchestration horizontally without coupling to compute logic. |
-| **Data quality at the earliest stage** | Bronze layer validates, deduplicates, and quarantines bad records before they propagate. This guarantees downstream layers receive clean data and prevents silent corruption in KPIs. |
-| **Analytics readiness** | Each Medallion layer is progressively cleaner and more aggregated. Analysts work at Silver; BI consumers work at Gold. Each layer is self-contained and independently queryable. |
-| **Incremental and idempotent** | The pipeline re-runs per date partition (`_load_date`) without duplicating or corrupting data. Re-running the same date always produces the same output — a critical property for daily production schedules and incident recovery. |
+**ADLS Gen2 for Raw:** ADLS Gen2 is the purpose-built landing zone for immutable, append-only files with schema-on-read semantics. Raw JSON files are landed as-is, partitioned by `_load_date`, and never overwritten. This is the foundation of replayability — if Bronze or Silver logic changes, Raw is re-read for any date and replayed.
+
+**ADLS Gen2 for Bronze and Silver:** ADLS Gen2 with Parquet stores the first two transformation layers in the data lake — not the warehouse. Bronze stores flattened, type-cast, deduplicated events in Parquet; Silver stores enriched and aggregated data in Parquet. This keeps the Medallion architecture clean: Raw/Bronze/Silver all live in the lake, Gold lives in the warehouse.
+
+**PySpark for Bronze and Silver — Why, Not pandas:**
+
+* **Scalability:** PySpark distributes work across executor JVMs. At 10M+ records or multi-GB files, pandas serial/deserial in a single Python process becomes a memory bottleneck. PySpark parallelizes reads, joins, and aggregations across cores and nodes.
+* **Distributed processing:** Spark reads Parquet columnar format in partitions — only the columns needed are loaded from disk. pandas loads entire files into memory as row-based JSON/record structures.
+* **Future data growth:** If ingestion grows to 5M–10M records/day or multi-source enrichment (clickstream + viewing logs), the pandas in-memory model hits a ceiling. PySpark scales linearly with executor count — same code, no rewrite.
+* **Schema enforcement at read time:** Spark's `spark.read.json` with an explicit schema rejects type mismatches at read time, not post-cast. pandas silently coerces or coerces with warnings.
+* **No cluster management overhead for this scale:** PySpark runs in local mode (`spark-submit --master local[*]`) on a single machine — same single-process simplicity as pandas, with the ability to promote to a cluster config (`yarn`, `k8s`) when scale demands it. No configuration overhead until it's needed.
+
+**Synapse Serverless SQL for Gold only:** Gold KPIs (the final fact table consumed by BI) live in the data warehouse. This is the correct home for a curated, tested, business-facing dataset — it enforces schema at write time, supports DirectQuery from Power BI, and is the stable contract between the pipeline and its consumers.
+
+**dbt for Gold:** Gold KPIs are computed in SQL using dbt. dbt runs against Synapse Serverless SQL, produces tested and documented SQL models, and is the standard tool for warehouse transformation at this scale.
+
+**Airflow for orchestration only:** Schedules and triggers four Python script calls. No transformation logic lives inside the Airflow DAG — each task is a `PythonOperator` that calls a standalone script entrypoint. Orchestration and processing evolve independently.
+
+**Power BI for serving:** Reads `gold_kpi_metrics` via DirectQuery or Import from Synapse Serverless SQL. BI consumers never query Bronze or Silver — the Gold fact table is the stable contract.
+
+### Tool Responsibility
+
+Every pipeline step has exactly one tool responsible for it. No tool does work outside its defined role.
+
+| Step | Tool | Action | Must NOT do |
+|---|---|---|---|
+| **Ingest** | Python script (Airflow-triggered) | Copy JSON files from on-prem export share → ADLS `raw/` path, partitioned by `_load_date`. File copy via `azure-storage-blob` SDK. | Transform data. Write to Bronze. |
+| **Bronze read** | PySpark | `spark.read.json(raw/_load_date={date}/)` — reads exactly one date partition | Scan multiple date partitions in one read. |
+| **Bronze transform** | PySpark | `select("_source.*")` → cast types → dedup by `_id` → DQ evaluate → split valid/invalid | Apply business logic. Write to SQL. |
+| **Bronze write** | PySpark | Write valid rows as Parquet to `bronze/_load_date={date}/`. Write invalid rows to `bronze_quarantine/`. Overwrite partition. | Write to Silver. Write to SQL. |
+| **Silver read** | PySpark | `spark.read.parquet(bronze/_load_date={date}/)` — reads exactly one date partition | Scan multiple date partitions. Read from Raw directly. |
+| **Silver transform** | PySpark | Enrich AppName → Type → two-stage pivot → distinct device counts → platform summary | Sum contract device counts as the platform device count. |
+| **Silver write** | PySpark | Write contract stats and daily summary as Parquet to `silver/` partitions | Skip platform-level distinct device count. Write to SQL. |
+| **Synapse external tables** | Synapse Serverless SQL | `CREATE EXTERNAL TABLE` over `silver/` Parquet via `OPENROWSET`. Register Silver views in Synapse for dbt access. | Load Silver Parquet into a dedicated SQL pool. |
+| **Gold transform** | dbt | `dbt run` — reads Synapse external tables over Silver → `gold_kpi_metrics` in Synapse | Read from Bronze directly. Compute aggregations in Python. |
+| **Orchestration** | Airflow | `PythonOperator` → call `run_bronze.py`, `run_silver.py`, `run_synapse.py`, `run_gold.py`. Schedule, trigger, retry. | Run transformations directly inside DAG tasks. Write SQL or DataFrame logic inside the DAG. |
+| **Serving** | Power BI | DirectQuery or Import from `gold_kpi_metrics` in Synapse Serverless | Query Bronze or Silver directly. Bypass the Gold layer. |
 
 ### High-Level Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                         On-Premises                               │
-│              On-Premises SQL Server / Elasticsearch               │
+│  LAYER 1 — SOURCE                                                │
+│  JSON log files exported from Elasticsearch (local flat files)  │
+│  30 files/day, ~10K–20K records/file                           │
 └──────────────────────────────┬───────────────────────────────────┘
-                               │  EXTRACT
+                               │  INGEST (Python script, Airflow-triggered)
+                               │  az cp source/*.json → adls raw/_load_date={date}/
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                 Azure Data Factory (ADF)                         │
-│    Self-hosted IR: copy JSON exports → Data Lake raw zone        │
-│    Orchestrate daily incremental and full reload triggers        │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │  LOAD
-                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              Azure Blob / Data Lake Gen2                          │
+│  LAYER 2 — AZURE DATA LAKE GEN2 (ADLS Gen2)                    │
 │                                                                  │
-│   ┌────────────────────────────────────────────────────────────┐ │
-│   │  RAW LAYER  (Append-only landing zone)                    │ │
-│   │  Container: raw/                                          │ │
-│   │  • JSON files landed as-is; no schema enforcement        │ │
-│   │  • Partitioned by _load_date                               │ │
-│   │  • Immutable — files are never overwritten                │ │
-│   │  • Schema-on-read — parsed only when read into Bronze     │ │
-│   └────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │  TRANSFORM — Bronze (PySpark)
-                               │  Reads raw JSON → cleans → persists to DB
-                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│         PostgreSQL / Azure SQL Database                           │
-│                                                                  │
-│   ┌────────────────────────────────────────────────────────────┐ │
-│   │  BRONZE LAYER                                             │ │
-│   │  Table: raw_kplus_log                                     │ │
-│   │  • Flatten nested _source fields → top-level columns     │ │
-│   │  • Preserve _id (document key) for deduplication           │ │
-│   │  • Cast TotalDuration → INTEGER                            │ │
-│   │  • Deduplicate by _id; reject duplicates to quarantine     │ │
-│   │  • Validate: nulls, range, data types                      │ │
-│   │  • Partition key: _load_date for incremental reads        │ │
-│   └────────────────────────────────────────────────────────────┘ │
-│                               │  TRANSFORM — Silver (PySpark)    │
-│   ┌────────────────────────────────────────────────────────────┐ │
-│   │  SILVER LAYER                                            │ │
-│   │  Tables: silver_contract_stats, silver_daily_summary      │ │
-│   │  • Enrich AppName → content category (Type)               │ │
-│   │  • Aggregate total duration per contract × category       │ │
-│   │  • Count DISTINCT devices (Mac) per contract               │ │
-│   │  • Platform-level daily summaries                          │ │
-│   └────────────────────────────────────────────────────────────┘ │
-│                               │  TRANSFORM — Gold (dbt)          │
-│   ┌────────────────────────────────────────────────────────────┐ │
-│   │  GOLD LAYER  (Business KPIs — star schema)                │ │
-│   │  Table: gold_kpi_metrics                                   │ │
-│   │  • DAU, total_duration, avg_session_duration              │ │
-│   │  • active_contracts per date                               │ │
-│   │  • Documented in schema.yml; tested via dbt               │ │
-│   └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  RAW  (ADLS Gen2 — raw/ container)                         │ │
+│  │  Path: raw/_load_date={date}/                              │ │
+│  │  Format: JSON  │  Access: append-only, immutable          │ │
+│  │  Schema-on-read — parsed only when read into Bronze       │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                              │  BRONZE — PySpark (spark-submit) │
+│                              ▼  (flatten → cast → dedup → DQ)  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  BRONZE  (ADLS Gen2 — bronze/ container)                  │ │
+│  │  Path: bronze/_load_date={date}/                          │ │
+│  │  Format: Parquet  │  • Flatten _source.*  • Cast types    │ │
+│  │  • Dedup by _id  • DQ gate (fail-closed)                  │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                              │  SILVER — PySpark (spark-submit) │
+│                              ▼  (enrich → pivot → aggregate)    │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  SILVER  (ADLS Gen2 — silver/ container)                  │ │
+│  │  Path: silver/ (partitioned by _load_date)               │ │
+│  │  Format: Parquet  │  Tables: contract_stats, daily_summary│ │
+│  │  • AppName → content category (Type)                       │ │
+│  │  • Duration by contract × category (pivot)                  │ │
+│  │  • Distinct devices per contract + platform-level summary   │ │
+│  │  • Pre-aggregated daily summary (Synapse reads this)        │ │
+│  └────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────┬───────────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│               Azure Synapse Analytics / PostgreSQL               │
-│               Serve gold layer to BI tools                        │
+│  LAYER 3 — AZURE SYNAPSE ANALYTICS (Serverless SQL)           │
+│  External tables over Silver Parquet (OPENROWSET)             │
+│  dbt reads Synapse external tables → gold_kpi_metrics          │
+│  KPIs: total_dau, total_duration, avg_session_duration,           │
+│        active_contracts, unique_devices                          │
 └──────────────────────────────┬───────────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                           Power BI                                │
-│   Live import / DirectQuery from Synapse / PostgreSQL             │
-│   Dashboards: DAU trends, content categories,                    │
-│               device usage, contract-level statistics             │
+│  LAYER 4 — ORCHESTRATION (Airflow)                             │
+│  dag_etl_customer360                                          │
+│  task_ingest_raw → task_bronze_transform →                    │
+│  task_silver_transform → task_synapse_external →             │
+│  task_gold_dbt                                                │
+│  Each task = PythonOperator calling a script.                   │
+│  Zero transformation logic inside the DAG.                      │
+└──────────────────────────────┬───────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  LAYER 5 — SERVING (Power BI)                                  │
+│  gold_kpi_metrics → Synapse Serverless → Power BI             │
+│  DirectQuery or Import — BI consumers never query Bronze/Silver │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Each Layer Exists
 
-| Layer | Why it exists | What would break without it |
+| Layer | Why it exists | What breaks without it |
 |---|---|---|
-| **Raw** | Preserves original source data immutably; enables full replay and audit. Without it, any bad transform permanently destroys source fidelity. | Cannot replay or debug past data issues. |
-| **Bronze** | Applies first structural transformation (flatten, type-cast, dedup) while keeping the data as close to source as possible. Establishes the `_load_date` partition key for incremental reads. | Invalid types propagate; duplicates corrupt downstream aggregations; no partition key means full scans on every run. |
-| **Silver** | Applies business logic (category enrichment, device counting, contract-level aggregation) so analysts have a clean, enriched dataset ready for ad-hoc queries. | Business users see raw app names, not content categories; contract-level analytics require re-aggregation from raw every time. |
-| **Gold** | Produces a single, tested, documented fact table of KPIs. The only layer Power BI and end-users should touch. Acts as the stable contract between the pipeline and its consumers. | BI reports depend on fragile intermediate tables; any schema change in Silver breaks all dashboards silently. |
+| **Raw** | Preserves original source data immutably; enables full replay and audit. If Bronze logic changes, we re-read Raw for any date and replay. | Cannot replay or debug past data issues. |
+| **Bronze** | Applies first structural transformation (flatten, type-cast, dedup) and stores the result as Parquet in ADLS — keeping the lake clean and replayable. DQ gate quarantines bad records before they propagate. | Invalid types propagate; duplicates corrupt downstream aggregates; the Medallion chain is broken. |
+| **Silver** | Applies business logic (category enrichment, device counting, contract-level aggregation) and stores the result as Parquet in ADLS. Analysts query this layer directly for ad-hoc analysis. | Business users see raw app names; all downstream queries repeat enrichment and aggregation logic. |
+| **Gold** | Produces a single, tested, documented fact table of KPIs in Synapse Serverless SQL — the stable contract between the pipeline and its BI consumers. dbt runs the SQL transformation and enforces tests before any data reaches Power BI. | BI reports depend on fragile intermediate tables; any Silver schema change silently breaks dashboards. |
 
 ---
 
 ## 3. Data Flow
 
 ```
-STEP 1 ── EXTRACT & LOAD (EL)
+STEP 1 ── INGEST & LAND
 
-  On-Premises SQL Server / Elasticsearch
+  Elasticsearch JSON export (already on disk locally)
          │
-         │  ADF Self-hosted IR (copy activity)
+         │  Production: az cp source/*.json → adls://container/raw/
+         │  Local dev:  cp source/*.json → data/raw/
          ▼
-  Azure Blob / Data Lake Gen2  ──►  RAW LAYER
-  raw/{_load_date}/file.json     (immutable, append-only)
+  ADLS Gen2 — raw/  (immutable, append-only, schema-on-read)
+  raw/_load_date={date}/file.json
 
-  ⚠️  Nothing is transformed here. Data is landed as-is, exactly as it
-      existed in the source at the time of extraction. This is the EL
-      part of ELT — load first, transform later.
+  Nothing is transformed here. Data is landed as-is.
+  This is the EL in ELT — load first, transform later.
 
-STEP 2 ── BRONZE TRANSFORM (PySpark)
+STEP 2 ── BRONZE (PySpark → ADLS)
 
-  RAW Layer (JSON, schema-on-read)
-         │  spark.read.json(path) — reads all files matching _load_date
-         │  df.select("_source.*", "_id", "_load_date")  ← explicit select
-         │          retains _id alongside flattened fields
+  ADLS Raw (JSON)
+         │  spark-submit src/bronze/run_bronze.py --date {date}
+         │  spark.read.json("raw/_load_date={date}/")
+         │  select("_source.*") + retain _id, _load_date
+         │  Cast TotalDuration → IntegerType, Contract/Mac → StringType
+         │  Dedup by _id (dropDuplicates)
+         │  DQ evaluate (PySpark) → split valid / invalid
+         │  Write valid  → bronze/_load_date={date}/bronze_001.parquet
+         │  Write invalid → bronze_quarantine/_load_date={date}/
          ▼
-  PostgreSQL: raw_kplus_log
-         │  dropDuplicates(["_id"])       ← deduplicate by doc key
-         │  cast(TotalDuration → INTEGER)  ← enforce types
-         │  validate nulls and ranges       ← quarantine bad rows
+  ADLS Gen2 — bronze/  (Parquet, partitioned by _load_date)
+  bronze/_load_date={date}/bronze_001.parquet
+
+STEP 3 ── SILVER (PySpark → ADLS)
+
+  bronze/_load_date={date}/*.parquet
+         │  spark-submit src/silver/run_silver.py --date {date}
+         │  spark.read.parquet("bronze/_load_date={date}/")
+         │  Map AppName → Type (Truyền Hình / Phim Truyện / etc.)
+         │  Two-stage sum then pivot: Duration by contract × category
+         │  countDistinct(Mac) per contract → TotalDevices
+         │  Platform-level distinct device count (from raw Bronze rows)
+         │  Write contract stats → silver/contract_stats/_load_date={date}/
+         │  Write daily summary  → silver/daily_summary/_load_date={date}/
          ▼
-  PostgreSQL: raw_kplus_log            (append by _load_date partition)
-              bronze_kplus_log_rejected  (all rejected records + reason)
+  ADLS Gen2 — silver/  (Parquet, partitioned by _load_date)
+  silver/contract_stats/_load_date={date}/
+  silver/daily_summary/_load_date={date}/
 
-STEP 3 ── SILVER TRANSFORM (PySpark)
+STEP 4 ── GOLD (dbt + Synapse Serverless SQL)
 
-  bronze_kplus_log
-         │  withColumn("Type", when(AppName == ...))  ← category enrichment
-         │  groupBy("Contract", "Type").sum("total_duration")
-         │         → pivot(Type).sum("sum(TotalDuration)")
-         │         → one column per content category
-         │  groupBy("Contract").agg(countDistinct("Mac"))
-         │         → unique device count per contract
-         ▼  join on "Contract"
-  PostgreSQL: silver_contract_stats    (per-contract, per-category)
-              silver_daily_summary      (platform-level daily KPIs)
-
-STEP 4 ── GOLD TRANSFORM (dbt)
-
-  silver_contract_stats, silver_daily_summary
-         │  dbt run   (SQL models — SELECT FROM silver_*)
-         │  dbt test  (not_null, unique, accepted_range)
+  silver/daily_summary/_load_date={date}/*.parquet
+         │  Synapse external tables over Silver Parquet (OPENROWSET)
+         │  dbt run   (SELECT FROM external table → gold_kpi_metrics)
+         │  dbt test  (not_null, unique, accepted_range, singular SQL tests)
          ▼
-  PostgreSQL: gold_kpi_metrics  (date, total_dau, total_duration,
-                                   avg_session_duration, active_contracts)
+  Azure Synapse Serverless SQL: gold_kpi_metrics  (date, total_dau,
+      total_duration, avg_session_duration, active_contracts, unique_devices)
 
 STEP 5 ── CONSUME (Power BI)
 
-  gold_kpi_metrics → Synapse / PostgreSQL → Power BI dashboards
+  gold_kpi_metrics → Synapse Serverless SQL → Power BI dashboards
 ```
 
 ---
@@ -200,281 +223,431 @@ STEP 5 ── CONSUME (Power BI)
 
 | Category | Technology | Role |
 |---|---|---|
-| **Data Source** | On-premises SQL Server / Elasticsearch | Origin of JSON log exports |
-| **Data Lake** | Azure Blob Storage / Data Lake Gen2 | Raw layer — immutable, append-only landing zone |
-| **Data Warehouse** | PostgreSQL (dev) / Azure SQL Database (prod) | Bronze, Silver, and Gold layers |
-| **Orchestration** | Azure Data Factory (ADF) + Apache Airflow | Pipeline scheduling, triggers, and dependency management |
-| **Processing** | PySpark (Python) | Distributed ELT transformations across Bronze and Silver |
-| **Transformation** | dbt | Gold layer SQL models, documentation, and testing |
-| **BI & Serving** | Power BI + Azure Synapse Analytics | Dashboards and live BI connectivity |
-| **Infrastructure as Code** | Terraform + Bicep | Provision Data Lake, Azure SQL, Key Vault, and ADF |
-| **CI/CD** | GitHub Actions | Automated testing and deployment on pull requests |
+| **Data Source** | Elasticsearch JSON exports (local flat files) | Origin of JSON log records. A Python script copies files to ADLS raw/ in production; file copy in dev. |
+| **Raw Storage** | Azure Blob / ADLS Gen2 | Immutable, append-only landing zone, partitioned by `_load_date`. Raw JSON is never modified after landing. |
+| **Bronze & Silver Storage** | Azure Blob / ADLS Gen2 | Parquet files for Bronze and Silver. Partitioned by `_load_date`. Medallion layers live in the lake, not the warehouse. |
+| **Gold Storage** | Azure Synapse Analytics — Serverless SQL Pool | Gold layer only. dbt reads Synapse external tables over Silver Parquet. |
+| **Gold Access Layer** | Synapse Serverless SQL (external tables) | `CREATE EXTERNAL TABLE` over Silver Parquet via OPENROWSET. dbt queries these tables. |
+| **Orchestration** | Apache Airflow | Schedule, trigger, and retry PythonOperator tasks calling PySpark/dbt scripts. Zero transformation logic inside the DAG. |
+| **Processing** | PySpark (`spark-submit`) | All Bronze and Silver transformations via `spark-submit` from Airflow. Handles large-scale distributed reads/writes of Parquet in ADLS. |
+| **Bronze & Silver I/O** | PySpark (`spark.read.parquet`, `spark.write.parquet`) | Native Spark DataFrame API for reading/writing Parquet to ADLS. |
+| **Transformation** | dbt Core | Gold layer SQL models, documentation, and testing. Runs in Airflow task after Synapse external tables are up-to-date. |
+| **BI & Serving** | Power BI + Synapse Serverless SQL | Dashboards from gold_kpi_metrics via DirectQuery or Import. |
+| **Infrastructure as Code** | Terraform | Provision ADLS Gen2, Azure Synapse Serverless SQL, Key Vault. Single IaC tool. |
 
 ---
 
-## 5. ETL Implementation
+All processing logic lives in `src/bronze/` and `src/silver/`. Each module maps to a single execution step — no unnecessary indirection. PySpark runs in local mode (`spark-submit --master local[*]`) for development; promoted to cluster mode in production via `--master yarn` or Kubernetes.
 
-The pipeline uses **PySpark** for distributed processing of Elasticsearch JSON exports. Each stage maps directly to a Medallion layer. Code snippets below represent the core logic in `src/bronze/` and `src/silver/`.
+> **Partitioning strategy:** Every read and write is scoped to a single `_load_date` partition. This is the single control knob for all incremental behavior. No full Data Lake scans in production.
 
-> **Partitioning strategy:** All Bronze and Silver reads filter by `_load_date`. This means each daily run only touches the data it needs — no full table scans in production. The `_load_date` column is written by the ADF copy activity at ingest time and carried through every layer.
+> **Idempotency:** Every Bronze and Silver write overwrites its `_load_date` partition in ADLS. Re-running any stage for a given date replaces the partition entirely — no duplicates, no corruption.
 
-> **Idempotency:** Every layer uses `DELETE FROM table WHERE _load_date = ?` before its `INSERT INTO` for the same `_load_date`. Re-running any stage for a given date always produces the same output — no duplicates, no corruption.
-
-### 5.1 Read JSON from Raw Layer — `src/extract/load_raw.py`
+### 5.1 Ingest to Raw — `src/ingest/ingest_raw.py`
 
 ```python
-# In production: filter to only the target _load_date partition
-df = spark.read.json(f"{raw_base_path}/_load_date={target_date}/*.json")
+from azure.storage.blob import BlobServiceClient
+import glob, os
+
+conn_str = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+container = "raw"
+blob_client = BlobServiceClient.from_connection_string(conn_str)
+
+files = glob.glob(f"{local_raw_path}/_load_date={target_date}/*.json")
+for f in files:
+    blob_name = f"raw/_load_date={target_date}/{os.path.basename(f)}"
+    blob_client.get_blob_client(container, blob_name).upload_blob(
+        open(f, "rb"), overwrite=False  # fail-safe: do not overwrite
+    )
 ```
 
-- Reads raw JSON files from the Data Lake, scoped to a single `_load_date` partition.
-- PySpark auto-infers schema from the Elasticsearch export format (nested under `_source`).
-- Partition pruning at read time (`_load_date=...`) avoids scanning irrelevant files — critical for incremental performance at scale.
+- `overwrite=False` is the append-only guarantee for Raw. Re-running the ingest task for the same date is a no-op.
 
-### 5.2 Flatten Nested Fields — `src/bronze/flatten_source.py`
+### 5.2 Read from Raw — `src/bronze/load_raw.py`
 
 ```python
-# Explicitly select _source fields AND retain _id as a top-level column.
-# _id is the Elasticsearch document key — it MUST be preserved here
-# because downstream deduplication depends on it.
-df = df.select(
-    "_id",
-    "_source.Contract",
-    "_source.Mac",
-    "_source.TotalDuration",
-    "_source.AppName",
-    "_source._load_date"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.master("local[*]").getOrCreate()
+
+raw_df = (
+    spark.read.json(f"{raw_base_path}/_load_date={target_date}/*.json")
+    .select("_source.*", "_id", "_load_date")
 )
 ```
 
-- Elasticsearch nests all business fields under `_source`. Flattening promotes them to top-level columns.
-- **`_id` is explicitly retained** — it is the document key used for deduplication and audit. Without it, duplicate detection is impossible.
-- `_load_date` is also promoted so every row carries its ingestion partition forward.
+- `spark.read.json` with a path glob reads all JSON files for exactly one `_load_date` partition — no cross-partition scans.
+- An explicit `select` after read projects only needed fields and avoids loading oversized nested fields.
 
-### 5.3 Deduplicate and Cast — `src/bronze/deduplicate_and_cast.py`
+### 5.3 Transform Bronze — `src/bronze/transform.py`
+
+Executes in a single step: flatten → cast → dedupe → DQ split. No intermediate DataFrames.
 
 ```python
-# Remove duplicate document IDs within the same load batch.
-# A duplicate _id means Elasticsearch emitted the same record twice —
-# this is a known behavior under heavy load. We keep the first occurrence.
-df = df.dropDuplicates(["_id"])
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col
 
-# Enforce column types. Spark reads TotalDuration as String from JSON;
-# casting to Integer here prevents type errors downstream in aggregations.
-df = df.withColumn("TotalDuration", col("TotalDuration").cast("INTEGER"))
-df = df.withColumn("Contract",       col("Contract").cast("STRING"))
-df = df.withColumn("Mac",            col("Mac").cast("STRING"))
+bronze_df = raw_df  # already flattened by select in load_raw
+
+bronze_df = bronze_df.withColumn(
+    "total_duration", col("TotalDuration").cast("INT")
+)
+bronze_df = bronze_df.withColumn("contract", col("Contract").cast("STRING"))
+bronze_df = bronze_df.withColumn("mac",       col("Mac").cast("STRING"))
+
+bronze_df = bronze_df.dropDuplicates(["_id"])
+
+valid_df, invalid_df, dq_report = dq_engine.evaluate(bronze_df, rules, thresholds)
 ```
 
-- **`dropDuplicates(["_id"])`**: Keeps one row per document ID per load batch. Without this step, the same viewing session counted twice corrupts all downstream KPIs (DAU, total duration, etc.).
-- **Type casting**: Prevents silent failures in `sum()` and `groupBy()` operations. String-typed integers silently sort alphabetically in `ORDER BY` but fail at `SUM` in strict mode.
-- Validated rows go to `raw_kplus_log`; rejected rows go to `bronze_kplus_log_rejected`.
+- `dropDuplicates(["_id"])` prevents the same Elasticsearch document from being double-counted.
+- DQ engine (`src/dq/evaluate.py`) is called inline — it owns the split logic, no other module routes valid/invalid records.
 
-### 5.4 Count Distinct Devices per Contract — `src/silver/calculate_devices.py`
+### 5.4 Write Bronze — `src/bronze/write.py`
 
 ```python
-# Count UNIQUE devices per contract — NOT total rows.
-# One device (same Mac) used by one contract across 20 sessions
-# must count as 1 device, not 20.
-total_devices = (
-    df.select("Contract", "Mac")
-      .distinct()                          # first: unique (Contract, Mac) pairs
-      .groupBy("Contract")
-      .agg(count("*").alias("TotalDevices"))  # then: count contracts
+from pyspark.sql import SparkSession
+
+def write_bronze(valid_df, invalid_df, target_date, adls_base):
+    bronze_path = f"{adls_base}/bronze/_load_date={target_date}/"
+
+    # Overwrite the date partition — idempotent by design.
+    (
+        valid_df.write
+        .mode("overwrite")
+        .partitionBy("_load_date")
+        .parquet(bronze_path)
+    )
+
+    q_path = f"{adls_base}/bronze_quarantine/_load_date={target_date}/"
+    (
+        invalid_df.write
+        .mode("overwrite")
+        .partitionBy("_load_date")
+        .parquet(q_path)
+    )
+```
+
+- `mode("overwrite")` + `partitionBy("_load_date")` is the idempotent write pattern for a file-based layer. Re-running the same date replaces the partition entirely.
+- Quarantine path `bronze_quarantine/` mirrors the Bronze partition structure — zero data loss, full replayability.
+
+### 5.5 Read from Bronze — `src/silver/read_bronze.py`
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.master("local[*]").getOrCreate()
+
+bronze_df = (
+    spark.read.parquet(f"abfss://bronze@{account}.dfs.core.windows.net/"
+                       f"_load_date={target_date}/")
 )
 ```
 
-- **`count("*")` after `.distinct()`** is equivalent to counting unique MAC addresses per contract. Using `count("*")` on the pre-distincted DataFrame would overcount.
-- `countDistinct("Mac")` inside `agg()` is the direct alternative and is preferred in production for readability.
-- This feeds `silver_contract_stats` where analysts need to know how many distinct devices each subscriber uses — a key churn and engagement signal.
+- `spark.read.parquet` with the `abfss://` URI reads directly from ADLS Gen2 with partition pruning on `_load_date`.
+- No cross-partition scan — exactly one date is loaded per run.
 
-### 5.5 Enrich Content Category — `src/silver/enrich_category.py`
+### 5.6 Enrich and Aggregate Silver — `src/silver/enrich_and_aggregate.py`
 
-```python
-# Map raw app names to business-friendly Vietnamese content categories.
-# Without this mapping, analysts must memorize app codes (DSHD, BHD_RES, etc.)
-# and category logic would be duplicated across every downstream query.
-df = df.withColumn("Type",
-    when(col("AppName").isin("CHANNEL","DSHD","KPLUS","KPlus"), "Truyền Hình")
-   .when(col("AppName").isin("VOD","FIMS_RES","BHD_RES","VOD_RES","FIMS","BHD","DANET"), "Phim Truyện")
-   .when(col("AppName") == "RELAX", "Giải Trí")
-   .when(col("AppName") == "CHILD", "Thiếu Nhi")
-   .when(col("AppName") == "SPORT", "Thể Thao")
-   .otherwise("Error")
-)
-```
-
-- Translates cryptic app codes into business categories that map directly to the content team's organizational structure.
-- The `otherwise("Error")` bucket catches any unrecognized app names, flagging them for investigation without crashing the pipeline.
-- Enables content-type analytics: total viewing time and sessions broken down by category — the primary dimension in Power BI dashboards.
-
-### 5.6 Aggregate Duration by Contract × Category — `src/silver/calculate_statistics.py`
+Single step: category enrichment → contract × category pivot → device count → platform summary.
 
 ```python
-# First aggregation: sum duration per (Contract, Type) pair.
-# This normalizes multi-session records so each (contract, category) pair
-# gets exactly one row with the total time spent on that category.
+from pyspark.sql.functions import col, countDistinct, sum as spark_sum
+
+type_map = {
+    "CHANNEL": "Truyền Hình", "DSHD": "Truyền Hình",
+    "KPLUS": "Truyền Hình",  "KPlus": "Truyền Hình",
+    "VOD": "Phim Truyện",    "FIMS_RES": "Phim Truyện",
+    "BHD_RES": "Phim Truyện", "VOD_RES": "Phim Truyện",
+    "FIMS": "Phim Truyện",   "BHD": "Phim Truyện",
+    "DANET": "Phim Truyện",
+    "RELAX": "Giải Trí",
+    "CHILD": "Thiếu Nhi",
+    "SPORT": "Thể Thao",
+}
+
+from pyspark.sql.functions import create_map, lit
+from itertools import chain
+
+type_expr = create_map([lit(x) for x in chain(*type_map.items())])
+df = bronze_df.withColumn("type", type_expr[col("app_name")])
+
+# Two-stage: sum then pivot — prevents overcounting multiple sessions
+# in the same category for the same contract.
 interim = (
-    df.select("Contract", "TotalDuration", "Type")
-      .groupBy("Contract", "Type")
-      .sum("TotalDuration")
-      .withColumnRenamed("sum(TotalDuration)", "DurationByCategory")
+    df.groupBy("contract", "type")
+      .agg(spark_sum("total_duration").alias("duration_by_category"))
 )
 
-# Pivot: convert Type rows into columns — one column per content category.
-# Result grain: one row per Contract; columns = DurationByCategory per category.
-# Pivot enables single-pass SELECT in dbt/Power BI without complex CASE WHEN.
 statistics = (
-    interim
-      .groupBy("Contract")
-      .pivot("Type")
-      .sum("DurationByCategory")
-      .na.fill(0)
+    interim.groupBy("contract")
+          .pivot("type")
+          .agg(spark_sum("duration_by_category"))
+          .fillna(0)
+)
+
+# Distinct MAC addresses per contract.
+total_devices = (
+    df.groupBy("contract")
+      .agg(countDistinct("mac").alias("total_devices"))
+)
+
+result = statistics.join(total_devices, on="contract", how="inner")
+result = result.withColumn("_load_date", lit(target_date))
+
+# Platform-level distinct device count: computed directly from all Bronze
+# rows — NOT SUM(total_devices), which double-counts shared devices.
+platform_devices = (
+    bronze_df.groupBy("_load_date")
+            .agg(countDistinct("mac").alias("unique_devices"))
+)
+
+daily_summary = (
+    result.groupBy("_load_date")
+         .agg(
+             spark_sum("total_duration").alias("total_duration"),
+             countDistinct("contract").alias("active_contracts"),
+         )
+         .join(platform_devices, on="_load_date", how="left")
 )
 ```
 
-- **Two-stage aggregation** (sum then pivot) avoids the common pitfall of pivoting on raw rows, which produces incorrect totals when a contract has multiple sessions in the same category.
-- **`na.fill(0)`**: Contracts that had zero viewing time in a category get `0`, not `null`. This prevents `NULL` arithmetic in dbt (e.g., `total = col_a + col_b` would return `NULL` if any column is `NULL`).
+- `fillna(0)` on the pivot output prevents `null + x = null` arithmetic errors in dbt.
+- `unique_devices` is `countDistinct(mac)` across all Bronze rows for the date — never `SUM(total_devices)`.
+- `platform_devices` is derived from the raw Bronze `bronze_df`, not from the already-aggregated `result` — this prevents double-counting shared devices across contracts.
 
-### 5.7 Join and Persist to Silver — `src/silver/finalize_result.py`
+### 5.7 Write Silver — `src/silver/write_silver.py`
 
 ```python
-# Inner join: only contracts that appear in BOTH statistics AND device count.
-# Contracts with stats but no device record (edge case: single-session contracts)
-# are excluded — they contribute zero to all downstream KPIs anyway.
-result = statistics.join(total_devices, "Contract", "inner")
+def write_silver(result, daily_summary, target_date, adls_base):
+    path_stats = f"{adls_base}/silver/contract_stats/_load_date={target_date}/"
+    (
+        result.write
+        .mode("overwrite")
+        .partitionBy("_load_date")
+        .parquet(path_stats)
+    )
 
-# Write to PostgreSQL via JDBC — partition-aware upsert:
-#   DELETE FROM silver_contract_stats WHERE _load_date = ?
-#   INSERT INTO silver_contract_stats VALUES (...)
-# This makes the write idempotent per _load_date.
-result.write \
-    .format("jdbc") \
-    .option("url", jdbc_url) \
-    .option("dbtable", "silver_contract_stats") \
-    .option("batchsize", 1000) \
-    .mode("overwrite") \
-    .save()
+    path_summary = f"{adls_base}/silver/daily_summary/_load_date={target_date}/"
+    (
+        daily_summary.write
+        .mode("overwrite")
+        .partitionBy("_load_date")
+        .parquet(path_summary)
+    )
 ```
 
-- **`inner` join**: Only contracts present in both the duration pivot and the device count contribute to the final table. This is correct because a contract with no duration stats contributes zero to all KPIs.
-- **`batchsize=1000`**: JDBC batch inserts reduce round-trips to the database — critical at 300K–600K records/day.
-- **Partition-aware upsert (DELETE then INSERT by `_load_date`)**: This is what makes the Silver write idempotent. A given `_load_date` always ends up with exactly one consistent state.
-
-> ⚠️ **`repartition(1)` is demo/development only.** For local testing or single-file output, `repartition(1)` consolidates output to one file. In production on Azure, write directly via JDBC or use `df.write.jdbc()` with partitioned inserts — this parallelizes writes and avoids a single-driver bottleneck.
+- Both outputs are computed from Bronze in one pass — no re-reading of source data.
+- `daily_summary` is pre-aggregated at date grain so `dbt run` is fast and the model SQL is trivial.
+- Overwrite per `_load_date` partition = idempotent.
 
 ---
-
 ## 6. Data Model
 
 ### Raw Layer — `raw/`
 
-> Location: **Azure Blob / Data Lake Gen2** (`raw/` container). Schema-on-read; immutable; append-only.
-
-> **Why append-only?** Raw files are never modified or deleted. If Bronze logic changes, we can re-read raw for any date and replay. This is the foundation of replayability and audit.
+> Location: **ADLS Gen2** (`raw/` container). Schema-on-read; immutable; append-only.
 
 | Artifact | Description |
 |---|---|
-| `raw/_load_date=2022-04-01/file.json` | One or more JSON files per date partition, landed as-is from the on-premises source. `_load_date` is virtual (folder prefix) and physical (written by ADF at ingest). Files are never overwritten. |
+| `raw/_load_date=YYYY-MM-DD/file.json` | One or more JSON files per date partition, landed as-is. `_load_date` is a virtual folder prefix (for partition pruning). Files are never overwritten. |
 
-### Bronze Layer — `raw_kplus_log`
+### Bronze Layer — `bronze/`
 
-> Location: **PostgreSQL / Azure SQL Database**. First structured, enforced layer — deduplicated, type-cast, and validated. This is the **system of record** for raw events.
+> Location: **ADLS Gen2** (`bronze/` container). Format: Parquet, partitioned by `_load_date`. Schema enforced at write time by PySpark.
 
 | Column | Type | Description |
 |---|---|---|
-| `_id` | VARCHAR | Elasticsearch document ID — unique per load batch. Used as deduplication key. |
-| `contract` | VARCHAR | Contract/subscriber code |
-| `mac` | VARCHAR | Device MAC address |
-| `total_duration` | INTEGER | Total viewing time in seconds (cast from string at ingest) |
-| `app_name` | VARCHAR | App name (KPLUS, VOD, SPORT, etc.) |
-| `_ingestion_ts` | TIMESTAMP | When the record was written to Bronze |
-| `_load_date` | DATE | **Partition key.** All queries scope to this; no full table scans in production. |
-| `_file_name` | VARCHAR | Source file reference for audit trail |
+| `_id` | STRING | Elasticsearch document ID. Deduplication key. Lives at document root, not inside `_source`. |
+| `contract` | STRING | Contract/subscriber code |
+| `mac` | STRING | Device MAC address |
+| `total_duration` | INT64 | Total viewing time in seconds. Enforced Int64 at ingest. |
+| `app_name` | STRING | App name (KPLUS, VOD, SPORT, etc.) |
+| `_load_date` | STRING | **Partition key.** Every read and write is scoped to this. |
+| `_file_name` | STRING | Source file reference for audit trail |
 
-**Quarantine table:** `bronze_kplus_log_rejected` — captures records failing `_id` uniqueness, NULL key fields, or invalid `total_duration` range (negative values). Zero data loss at ingest. Each row includes the original raw payload and an `error_reason` string for debugging and manual replay.
+**Quarantine path:** `bronze_quarantine/_load_date={date}/rejected_001.parquet` — same schema plus `_raw_payload` (original row as JSON string) and `_error_reason` (STRING). Zero data loss.
 
-### Silver Layer — `silver_*`
+### Silver Layer — `silver/`
 
-> Location: **PostgreSQL / Azure SQL Database**. Cleansed, enriched, and business-ready. This is the layer analysts query directly for ad-hoc analysis.
+> Location: **ADLS Gen2** (`silver/` container). Format: Parquet, partitioned by `_load_date`. Cleansed, enriched, and business-ready.
 
-| Table | Grain | Description |
+| Table / Path | Grain | Description |
 |---|---|---|
-| `silver_contract_stats` | Contract × `_load_date` | Per-contract daily metrics: `contract`, `_load_date`, `mac`, `total_sessions`, `total_duration`, `avg_session_duration` |
-| `silver_daily_summary` | `_load_date` | Platform-level daily KPIs: `_load_date`, `total_contracts`, `total_sessions`, `total_duration`, `avg_duration`, `unique_devices` |
-| `silver_category_pivot` | Contract × `_load_date` | Contract × content category pivot with duration columns per category |
+| `silver/contract_stats/_load_date={date}/contract_stats.parquet` | Contract × `_load_date` | Per-contract daily metrics: contract, `_load_date`, `total_devices`, per-category durations, `total_sessions`, `total_duration`, `avg_session_duration` |
+| `silver/daily_summary/_load_date={date}/daily_summary.parquet` | `_load_date` | Platform-level daily KPIs. **Pre-aggregated at this grain — dbt reads this directly for Gold.** `unique_devices` is platform-level `countDistinct(Mac)` computed directly from Bronze rows. |
 
-> **Why `silver_daily_summary`?** Pre-aggregated platform-level KPIs avoid repeated full-scans from `silver_contract_stats` in dbt. dbt reads from `silver_daily_summary` (one row per date) instead of computing `SUM(contract_stats)` on every run — significantly faster CI cycles and Power BI refresh.
+> `daily_summary` is pre-aggregated at date grain because `dbt run` reads it on every run. One row per date makes dbt fast and the model SQL trivial.
 
 ### Gold Layer — `gold_kpi_metrics`
 
-> Location: **PostgreSQL / Azure SQL Database**. Built by **dbt** models. Business-ready KPIs — the stable contract between the pipeline and its consumers.
+> Location: **Azure Synapse Analytics — Serverless SQL Pool**. Built by **dbt** models. dbt reads Synapse external tables over Silver Parquet. Business-ready KPIs. The only layer Power BI touches.
 
 | Column | Type | Description |
 |---|---|---|
 | `date` | DATE | Aggregation date |
-| `total_dau` | INTEGER | Daily Active Users (count of distinct `contract` from Silver for this date) |
+| `total_dau` | INTEGER | Daily Active Users — distinct contracts from Silver for this date |
 | `total_duration` | BIGINT | Total platform viewing time in seconds |
 | `avg_session_duration` | FLOAT | Average viewing time per session |
 | `active_contracts` | INTEGER | Number of active subscriber contracts |
+| `unique_devices` | INTEGER | Platform-level distinct devices. Separate from `total_dau` — a device may be associated with multiple contracts, so `unique_devices <= total_dau` always. |
 
 ---
 
 ## 7. ETL Modes
 
 ```bash
-# Incremental — yesterday only (default for daily Airflow schedule)
-python etl.py --mode incremental
-
-# Incremental — specific date
-python etl.py --mode incremental --date 2022-04-15
-
-# Date range — bulk backfill
+python etl.py --mode incremental          # yesterday only
+python etl.py --mode incremental --date 2022-04-15   # specific date
 python etl.py --mode date_range --start 2022-04-01 --end 2022-04-30
-
-# Full reload — truncate all layers and reprocess from scratch
-python etl.py --mode full
+python etl.py --mode full                 # re-write all Raw partitions in Bronze/Silver
 ```
 
 | Mode | When to use | What it does |
 |---|---|---|
-| `incremental` | Daily production schedule | Reads only the target `_load_date` from Raw; runs Bronze → Silver → Gold for that date only |
+| `incremental` | Daily production schedule | Reads only the target `_load_date`; runs Bronze → Silver → Synapse external tables → Gold for that date only |
 | `date_range` | Backfill or historical loads | Runs incremental logic for every date in the range; each date is independent and idempotent |
-| `full` | Schema change, data corruption recovery | Truncates Bronze, Silver, and Gold; re-ingests all available Raw data |
+| `full` | Schema change or data corruption | Re-writes all available `_load_date` partitions in Bronze and Silver by overwriting each partition. dbt re-runs all incremental models. |
 
-### Airflow DAG Dependencies
+### Airflow DAG
 
 ```
 dag_etl_customer360
 │
-├─► task_raw_ingest        # ADF: land JSON → raw/ in Data Lake
-│                          #   Only copies files for the target _load_date
-│                          #   to maintain the Raw partition boundary.
-├─► task_bronze_transform  # PySpark: read raw → flatten → dedup → validate
-│                          #   → raw_kplus_log (append by _load_date)
-│                          #   → bronze_kplus_log_rejected (quarantine)
-├─► task_silver_aggregate  # PySpark: read bronze → enrich → pivot → aggregate
-│                          #   → silver_contract_stats + silver_daily_summary
-└─► task_gold_metrics      # dbt run + dbt test
-                           #   Reads silver_* → gold_kpi_metrics
+├──► task_ingest_raw
+│     Script: src/scripts/ingest_raw.py
+│     Action: List JSON files for _load_date → upload to ADLS raw/ with overwrite=False
+│     Must NOT: Transform data. Write to Bronze or Silver.
+│
+├──► task_bronze_transform
+│     Script: src/scripts/run_bronze.py  (wraps: spark-submit run_bronze.py)
+│     Action: spark.read.json(raw/) → flatten → cast → dedup → DQ split → write Parquet
+│     Output: bronze/_load_date={date}/*.parquet, bronze_quarantine/_load_date={date}/*.parquet
+│     Must NOT: Run Silver logic. Run dbt. Write to SQL.
+│
+├──► task_silver_transform
+│     Script: src/scripts/run_silver.py  (wraps: spark-submit run_silver.py)
+│     Action: spark.read.parquet(bronze/) → enrich → pivot → aggregate → write Parquet
+│     Output: silver/contract_stats/_load_date={date}/*.parquet,
+│             silver/daily_summary/_load_date={date}/*.parquet
+│     Must NOT: Re-read raw JSON. Run Bronze logic. Run dbt.
+│
+├──► task_synapse_external
+│     Script: src/scripts/run_synapse.py  (runs SQL via python + synapse connection)
+│     Action: CREATE OR ALTER EXTERNAL TABLE over silver/daily_summary/ partition
+│     Must NOT: Load Silver Parquet into a SQL pool. Compute aggregations here.
+│
+└──► task_gold_dbt
+      Script: src/scripts/run_gold.py  (wraps: cd dbt/customer360 && dbt run && dbt test)
+      Action: dbt reads Synapse external tables over Silver → writes gold_kpi_metrics
+      Output: gold_kpi_metrics in Synapse Serverless SQL
+      Must NOT: Run PySpark logic. Read raw JSON. Bypass dbt.
 ```
+
+**Each Airflow task is a `PythonOperator` calling a standalone script entrypoint. Zero transformation logic lives inside the DAG.**
 
 ---
 
 ## 8. Data Quality
 
-| Check | Rule | Where enforced | Handling |
-|---|---|---|---|
-| **Uniqueness** | `_id` must be unique within each Bronze load batch | PySpark (`dropDuplicates`) | Reject duplicates to `bronze_kplus_log_rejected` |
-| **Null check** | `contract`, `mac`, `total_duration` must not be NULL | PySpark filter | Reject to quarantine with `error_reason = 'NULL_VALUE'` |
-| **Range check** | `total_duration >= 0` | PySpark filter | Reject to quarantine with `error_reason = 'INVALID_RANGE'` |
-| **Type enforcement** | `TotalDuration` must cast to INTEGER | PySpark cast | Reject cast failures with `error_reason = 'TYPE_CAST_FAILED'` |
-| **dbt generic tests** | `not_null`, `unique`, `accepted_range` on `gold_kpi_metrics` | `schema.yml` | Fail CI on PR |
-| **dbt singular tests** | SQL-based assertions (e.g., `total_dau >= 0`) | `tests/` | Fail CI on PR |
+### DQ Engine — `src/dq/evaluate.py`
 
-- **Quarantine audit**: Every rejected record in `bronze_kplus_log_rejected` carries the original raw payload as a JSON string column (`_raw_payload`) plus `error_reason`, `_load_date`, and `_file_name` — enabling exact replay or manual fix without re-querying the source.
-- DQ metrics (record counts, rejection rates, null percentages) are logged at each PySpark stage and surfaced as Airflow XComs for operational dashboards.
-- **Data contract**: Silver and Gold tables are guaranteed to be non-null, unique by (`contract`, `_load_date`), and within expected ranges — validated by dbt on every run.
+The DQ engine is not logging infrastructure — it is a rule evaluator that splits the DataFrame and gates the pipeline. It runs as part of Bronze `transform.py`, not as a post-write hook.
+
+```python
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, concat_ws, lit, when, coalesce, expr
+from datetime import datetime, timezone
+
+def evaluate(spark_df: DataFrame, rules, thresholds) -> tuple:
+    """
+    Apply a defined rule set to a Bronze DataFrame (PySpark).
+    Returns (valid_df, invalid_df, dq_report).
+    """
+    violations_exprs = []
+    for rule in rules:
+        violations_exprs.append(
+            when(~rule.predicate(spark_df), lit(rule.name)).otherwise(lit(None))
+        )
+
+    invalid_df = spark_df.withColumn(
+        "_error_reason",
+        concat_ws(" | ", *[
+            coalesce(e, lit("")) for e in violations_exprs
+        ])
+    ).filter(col("_error_reason") != lit(""))
+
+    valid_df = spark_df.join(
+        invalid_df.select("_id"), on="_id", how="left_anti"
+    )
+
+    total     = spark_df.count()
+    invalid_n = invalid_df.count()
+
+    dq_report = {
+        "target_date":            None,
+        "total_rows":             total,
+        "valid_rows":             total - invalid_n,
+        "invalid_rows":           invalid_n,
+        "rejection_rate":         invalid_n / total if total else 0.0,
+        "rule_results":           {rule.name: invalid_df.filter(~rule.predicate(spark_df)).count()
+                                  for rule in rules},
+        "rejection_threshold":    thresholds.get("max_rejection_rate", 0.05),
+    }
+    return valid_df, invalid_df, dq_report
+```
+
+| Item | Detail |
+|---|---|
+| **Purpose** | Evaluate DQ rules against every Bronze row; split into valid and invalid DataFrames; produce a structured report |
+| **Input** | Bronze DataFrame (flattened, deduped, pre-cast); rule set; rejection thresholds |
+| **Output** | `(valid_df, invalid_df, dq_report)` — all three are consumed by downstream steps |
+| **Why it returns both DataFrames** | The calling step (`transform.py`) passes `valid_df` to the main Bronze write and `invalid_df` to the quarantine write. The DQ engine owns the split logic — no other module makes routing decisions. |
+
+**Configured rules:**
+
+| Rule | Predicate | Threshold |
+|---|---|---|
+| `not_null_contract` | `contract IS NOT NULL` | — |
+| `not_null_mac` | `mac IS NOT NULL` | — |
+| `not_null_duration` | `total_duration IS NOT NULL` | — |
+| `duration_non_negative` | `total_duration >= 0` | — |
+| `idempotency_check` | `_id IS NOT NULL` | — |
+
+### DQ Gating — fail-closed on threshold breach
+
+```python
+valid_df, invalid_df, dq_report = dq_engine.evaluate(spark_df, rules, thresholds)
+
+# Rejection rate threshold: halt the pipeline if too many records are bad.
+# A high rejection rate signals a source system issue — not a pipeline bug.
+# Writing a polluted partition to Silver would corrupt downstream KPIs silently.
+if dq_report["rejection_rate"] > dq_report["rejection_threshold"]:
+    raise DQThresholdExceeded(
+        f"Rejection rate {dq_report['rejection_rate']:.2%} exceeds threshold "
+        f"{dq_report['rejection_threshold']:.2%} for {target_date}. "
+        f"Halted before Silver. Check bronze_quarantine partition."
+    )
+
+# Below threshold: log, continue, and write both streams.
+log_dq_to_xcom(dq_report)   # surface metrics in Airflow
+write_bronze(valid_df, invalid_df, target_date)
+```
+
+- **Fail-closed**: if rejection rate exceeds the threshold (default 5%), the pipeline halts before Silver. A polluted partition in Bronze does not silently corrupt Gold KPIs.
+- **Fail-open for individual rule violations**: rows failing individual checks are quarantined, not rejected — the pipeline continues for the rest of the batch.
+
+### dbt Tests (Gold layer)
+
+| Test | Target | Behavior |
+|---|---|---|
+| `not_null` | All columns | Fail CI on PR if null values exist |
+| `unique` | `(date)` in `gold_kpi_metrics` | Exactly one row per date |
+| `accepted_range` | `total_dau >= 0`, `avg_session_duration >= 0` | No negative KPIs possible |
+| Singular: `total_dau_matches_contract_count` | SQL assertion | `total_dau` matches `SELECT COUNT(DISTINCT contract) FROM silver_contract_stats WHERE _load_date = date` |
+| Singular: `unique_devices_matches_bronze_count` | SQL assertion | `unique_devices` matches `SELECT COUNT(DISTINCT mac) FROM bronze_parquet WHERE _load_date = date` |
+
+The second singular test cross-checks that `unique_devices` was computed correctly at the platform level by counting distinct MACs directly from Bronze Parquet, not by summing contract-level device counts. This catches the double-counting bug described in Section 5.6.
 
 ---
 
@@ -482,51 +655,49 @@ dag_etl_customer360
 
 ### Why It Matters
 
-In production, pipelines run every day against live, evolving source systems. Without incremental and idempotent guarantees:
-
-- A rerun of yesterday's data doubles all KPIs (duplicate records).
+- A rerun of yesterday's date doubles all KPIs (duplicate records).
 - An Airflow retry after a partial failure creates corrupted aggregates.
-- A Bronze schema fix requires a full re-ingest of weeks of historical data.
+- A Bronze schema fix requires a full re-ingest of historical data without it.
 
-This pipeline avoids all three.
+### Incremental Reads
 
-### How It Works
-
-**Incremental reads (`_load_date` partition pruning)**
+All reads are partition-scoped by `_load_date`. No layer ever scans its entire dataset in production.
 
 ```python
-# Bronze reads only the target date from Raw — no full scans.
-spark.read.json(f"{raw_base_path}/_load_date={target_date}/*.json")
+# Bronze reads raw JSON for one date only — partition-scoped read.
+bronze_df = spark.read.json(f"{raw_base_path}/_load_date={target_date}/*.json")
 
-# Silver reads only the target date from Bronze.
-spark.read.jdbc(url, "raw_kplus_log",
-    columnAlias="_load_date", lowerBound=target_date, upperBound=target_date)
+# Silver reads Bronze Parquet for one date only — no full lake scan.
+silver_df = spark.read.parquet(f"bronze/_load_date={target_date}/")
 ```
 
-Every layer filters to the target `_load_date` at read time. The partition column is the single control knob for all incremental behavior.
+### Idempotent Writes
 
-**Idempotent writes (upsert per `_load_date`)**
+Every Bronze and Silver write overwrites its `_load_date` partition. The `full` mode re-writes all available date partitions in sequence.
 
-```sql
--- Before every insert into Bronze, Silver, or Gold:
-DELETE FROM raw_kplus_log WHERE _load_date = '{{ target_date }}';
+```python
+# Bronze and Silver: overwrite the date partition with new output.
+path = f"bronze/_load_date={target_date}/bronze_001.parquet"
+fs.create_file(path, overwrite=True)   # replaces the old partition entirely
+fs.append_data(path, parquet_buffer)
 
-INSERT INTO raw_kplus_log (...) VALUES (...);
+# Ingest: fail-safe append only.
+blob_client.upload_blob(open(f, "rb"), overwrite=False)  # silently skips if file exists
 ```
 
-Each layer follows the same pattern: `DELETE WHERE _load_date = X`, then `INSERT`. Re-running the same date always replaces the same data — never appends. The `full` mode simply deletes all dates before re-running.
+- **Bronze/Silver**: Overwrite `_load_date` partition with the new output. Re-running the same date replaces the partition — no duplicates, no corruption.
+- **Raw ingest**: `overwrite=False` makes Raw append-only. Re-running ingest for the same file is a no-op.
+- **`full` mode**: Re-writes all available date partitions by iterating over the Raw folder structure and running incremental logic for each `_load_date` found.
 
-**Deduplication via `_id`**
+### Failure Recovery
 
-Elasticsearch can emit duplicate `_id` values under heavy indexing load. `dropDuplicates(["_id"])` in Bronze ensures the raw event log has one row per document key. Because `_id` is preserved through `select("_source.*", "_id")` and not dropped, deduplication is accurate and auditable.
+If the pipeline fails mid-run after Bronze succeeds but before Silver writes:
 
-**Failure recovery**
-
-If the pipeline fails mid-run (e.g., after Bronze completes but before Silver), rerunning restores a consistent state:
-
-1. Bronze rerun: `DELETE + INSERT` for that `_load_date` → unchanged (idempotent).
-2. Silver rerun: `DELETE + INSERT` for that `_load_date` → unchanged (idempotent).
+1. Bronze rerun: overwrite `_load_date={target_date}` partition → consistent (idempotent).
+2. Silver rerun: overwrite `_load_date={target_date}` partition → consistent (idempotent).
 3. Gold rerun: `dbt run --select date={{ target_date }}` → replaces only that date's KPIs.
+
+No cleanup step is required before any rerun.
 
 ---
 
@@ -535,58 +706,51 @@ If the pipeline fails mid-run (e.g., after Bronze completes but before Silver), 
 ### Prerequisites
 
 - Python 3.10+
-- Java 11+ (required by PySpark)
 - Docker & Docker Compose
 - Azure account (production)
 
 ### Local Development
 
 ```bash
-# 1. Clone repo
+# 1. Clone and start services
 cd customer360-bigdata-pipeline
-
-# 2. Start PostgreSQL + Airflow
 docker compose -f docker/docker-compose.yml up -d
 
-# 3. Install Python dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment
+# 3. Configure environment
 cp .env.example .env
-# Edit: DB_HOST, DB_PORT, DB_NAME, AZURE_STORAGE_KEY, etc.
 
-# 5. Initialize database schemas
-psql -h localhost -U etl -d customer360 -f sql/00_colorschema.sql
-psql -h localhost -U etl -d customer360 -f sql/01_raw_schema.sql
-psql -h localhost -U etl -d customer360 -f sql/02_bronze_schema.sql
-psql -h localhost -U etl -d customer360 -f sql/03_silver_schema.sql
-psql -h localhost -U etl -d customer360 -f sql/04_gold_schema.sql
+# 4. Initialize Gold schemas in Synapse (local dev uses spark-submit in local mode)
+# For local dev: spark-submit runs PySpark Bronze/Silver directly; Gold SQL init is skipped
+# For prod: CREATE external data source + gold_kpi_metrics table in Synapse Serverless SQL
+# az synapse sql script run ... -f sql/01_gold_schema.sql
 
-# 6. Run full ETL pipeline (processes all available Raw data)
-python etl.py --mode full
+# 5. Copy sample JSON files to raw/ directory
+cp -r sample_data/raw/* data/raw/
 
-# 7. Run dbt transformations and tests
+# 6. Run the pipeline
+python etl.py --mode full          # initialise all data
+python etl.py --mode incremental   # daily schedule
+
+# 7. Run dbt Gold models
 cd dbt/customer360 && dbt run && dbt test
 
-# 8. Start Airflow
+# 8. Start orchestration
 export AIRFLOW_HOME=./airflow
-airflow db init
-airflow webserver --port 8080 &
-airflow scheduler &
+airflow db init && airflow webserver --port 8080 & airflow scheduler &
 ```
 
 ### Azure Production
 
 ```bash
-# 1. Authenticate
 az login
-./infra/scripts/setup_local.sh
-
-# 2. Provision infrastructure
 cd infra/terraform && terraform init && terraform apply
-
-# 3. Deploy ADF pipelines
-./infra/scripts/deploy_azure.sh
+# Terraform provisions: ADLS Gen2, Azure Synapse Analytics Serverless SQL, Key Vault
+# Airflow runs on a VM or Container Apps
+# Ingest script runs as an Airflow task (Python, not ADF)
+# PySpark Bronze/Silver runs via spark-submit in local mode (dev) or cluster mode (prod)
 ```
 
 ---
@@ -595,16 +759,16 @@ cd infra/terraform && terraform init && terraform apply
 
 | # | Description |
 |---|---|
-| 1 | Designed an **end-to-end ELT pipeline** following the **Medallion Architecture** (Raw → Bronze → Silver → Gold) for incremental and idempotent daily processing of ~300K–600K records. |
-| 2 | Built a **distributed data processing layer with PySpark**, handling nested Elasticsearch JSON at scale — using `_load_date` partition pruning for incremental reads, `dropDuplicates` for deduplication, and `pivot` for category-level aggregation. |
-| 3 | Implemented a **data ingestion layer with Azure Data Factory** (Self-hosted IR) connecting on-premises SQL Server to an immutable, append-only **Azure Data Lake Gen2** raw landing zone, partitioning by `_load_date` from day one. |
-| 4 | Orchestrated the full pipeline with **Apache Airflow** supporting three modes — daily incremental, date range backfill, and full reload — each tested and production-safe through partition-aware DELETE/INSERT idempotency. |
-| 5 | Engineered a **content category enrichment pipeline** (AppName → Vietnamese content types) and a **contract-level pivot aggregation** in PySpark, powering downstream BI dashboards without requiring business logic in SQL. |
-| 6 | Established a **data quality framework** with Bronze-layer quarantine tables — every rejected record is preserved with its raw payload, error reason, and source file reference, enabling zero-loss audit and manual replay. |
-| 7 | Built the **Gold layer using dbt** with `schema.yml` documentation, generic tests (`not_null`, `unique`, `accepted_range`), and singular tests — fully integrated into a **GitHub Actions CI pipeline** that gates every PR. |
-| 8 | Delivered **production-ready KPIs** (DAU, total duration, avg session duration, active contracts) to **Power BI** via **Azure Synapse Analytics**, using `silver_daily_summary` as a pre-aggregated source to minimize query latency. |
-| 9 | Deployed all cloud infrastructure as code using **Terraform** and **Bicep** — provisioning Data Lake, Azure SQL, Key Vault, and ADF pipelines with repeatable, audited, peer-reviewed deployments. |
-| 10 | Designed the **incremental and idempotent write strategy** (`DELETE WHERE _load_date = X` + `INSERT`) for all three structured layers — enabling safe daily re-runs, Airflow retry resilience, and incident recovery without data duplication or corruption. |
+| 1 | Designed an **end-to-end ELT pipeline** following the **Medallion Architecture** (Raw/Bronze/Silver in ADLS Gen2, Gold in Synapse Serverless SQL) for incremental and idempotent daily processing of ~300K–600K records. |
+| 2 | Built a **fail-closed DQ engine** (`src/dq/evaluate.py`) that evaluates configurable rules in PySpark, splits valid/invalid records, and halts the pipeline if the rejection rate exceeds the threshold — preventing polluted partitions from silently corrupting Gold KPIs. |
+| 3 | Orchestrated the full pipeline with **Apache Airflow** supporting three modes (incremental, date range, full reload) — each powered by the partition-overwrite idempotent write pattern for safe re-runs and Airflow retry resilience. |
+| 4 | Engineered a **content category enrichment + pivot aggregation** in a single PySpark step (`src/silver/enrich_and_aggregate.py`) — AppName → Vietnamese categories, two-stage sum-then-pivot for correct per-category totals, `fillna(0)` to prevent null arithmetic errors in dbt. |
+| 5 | Structured the **Silver layer with two distinct grain paths** — `silver/contract_stats/` (contract grain) for analyst ad-hoc queries and `silver/daily_summary/` (date grain) as a pre-aggregated source for dbt Gold models. `unique_devices` is computed as platform-level `countDistinct(Mac)` directly from Bronze Parquet — not as a sum of contract-level device counts, which would double-count shared devices. |
+| 6 | Built the **Gold layer using dbt** with `schema.yml` documentation, generic tests (`not_null`, `unique`, `accepted_range`), and singular SQL tests — including a cross-check that validates `unique_devices` against a direct `countDistinct(Mac)` from Bronze Parquet. |
+| 7 | Delivered **production-ready KPIs** (DAU, total duration, avg session duration, active contracts, unique devices) to **Power BI** via Synapse Serverless SQL. |
+| 8 | Deployed all cloud infrastructure as code using **Terraform** — provisioning ADLS Gen2, Azure Synapse Serverless SQL, Key Vault, and the ingest storage account. Single IaC tool, no state management conflicts. |
+| 9 | Designed the **partition-based idempotency strategy** across Bronze and Silver (overwrite `_load_date` partition in ADLS) — enabling safe daily re-runs, incident recovery without data loss, and full historical replays via the `full` mode. |
+| 10 | Maintained a **strict one-tool-per-role design** — Airflow orchestrates Python scripts, PySpark transforms Bronze and Silver, dbt runs Gold SQL models, ADLS Gen2 stores all Medallion layers, Synapse Serverless SQL serves only the Gold fact table to Power BI. |
 
 ---
 
@@ -612,174 +776,45 @@ cd infra/terraform && terraform init && terraform apply
 
 ```
 customer360-bigdata-pipeline/
-├── etl.py                         # Entry point: --mode incremental|date_range|full
+├── etl.py                       # Entry point: --mode incremental|date_range|full
 ├── src/
-│   ├── extract/
-│   │   └── load_raw.py            # Read JSON from Data Lake (partition-scoped)
+│   ├── ingest/
+│   │   └── ingest_raw.py         # Upload JSON files to ADLS raw/ (overwrite=False)
 │   ├── bronze/
-│   │   ├── flatten_source.py       # Flatten _source.*; retain _id + _load_date
-│   │   ├── deduplicate_and_cast.py # dropDuplicates(["_id"]); type enforcement
-│   │   └── quarantine.py           # Route rejected rows to quarantine table
+│   │   ├── load_raw.py           # PySpark JSON read with explicit schema, single date partition
+│   │   ├── transform.py           # Flatten + cast + dedup + DQ split (single PySpark step)
+│   │   └── write.py               # spark.write.parquet to ADLS bronze/ + quarantine/
 │   ├── silver/
-│   │   ├── enrich_category.py      # AppName → Vietnamese content category
-│   │   ├── calculate_devices.py    # countDistinct(Mac) per Contract
-│   │   ├── calculate_statistics.py # Pivot: duration × Contract × Category
-│   │   └── finalize_result.py      # Join + partition-aware upsert to Silver
-│   ├── gold/
-│   │   └── compute_kpis.py         # Stub for any pre-dbt Gold logic
-│   └── validation/
-│       └── run_dq_checks.py        # DQ metrics → Airflow XComs
+│   │   ├── read_bronze.py        # spark.read.parquet from bronze/ scoped by _load_date
+│   │   ├── enrich_and_aggregate.py  # Enrich + pivot + device counts + join (single PySpark step)
+│   │   └── write_silver.py        # spark.write.parquet to silver/contract_stats/ + silver/daily_summary/
+│   ├── dq/
+│   │   └── evaluate.py            # PySpark DQ rule engine: evaluate → split → report + gate
+│   └── scripts/
+│       ├── ingest_raw.py          # Airflow entrypoint: calls ingest
+│       ├── run_bronze.py          # Airflow entrypoint: calls bronze load+transform+write
+│       ├── run_silver.py           # Airflow entrypoint: calls silver read+enrich+write
+│       └── run_gold.py             # Airflow entrypoint: cd dbt && dbt run && dbt test
 ├── sql/
-│   ├── 00_colorschema.sql         # CREATE SCHEMA bronze silver gold
-│   ├── 01_raw_schema.sql          # raw_kplus_log + quarantine DDL
-│   ├── 02_bronze_schema.sql       # Indexes on _load_date, _id
-│   ├── 03_silver_schema.sql       # silver_contract_stats + summary DDL
-│   └── 04_gold_schema.sql          # gold_kpi_metrics DDL
+│   └── 01_gold_schema.sql         # Synapse Serverless SQL DDL: gold_kpi_metrics + external data source
 ├── dbt/customer360/
 │   ├── models/
 │   │   └── gold/
-│   │       └── gold_kpi_metrics.sql
-│   ├── schema.yml                  # Column types, generic tests
+│   │       └── gold_kpi_metrics.sql  # SELECT FROM silver_daily_summary Parquet → KPIs
+│   ├── schema.yml               # Column types + generic dbt tests
 │   └── tests/
-│       └── test_gold_kpis.sql      # Singular SQL tests
+│       └── test_gold_kpis.sql   # Singular SQL tests (DAU + device count cross-checks)
 ├── dags/
-│   └── dag_etl_customer360.py     # Airflow DAG with 4 tasks
+│   └── dag_etl_customer360.py   # Airflow DAG: 4 PythonOperator tasks
 ├── docker/
-│   └── docker-compose.yml          # PostgreSQL + Airflow
-├── infra/
-│   ├── terraform/                  # Data Lake, Azure SQL, networking
-│   └── bicep/                       # ADF pipeline definitions
+│   └── docker-compose.yml       # LocalStack (S3-compatible) + PostgreSQL + Airflow
+├── infra/terraform/
+│   └── main.tf                 # ADLS Gen2, Azure Synapse Serverless SQL, Key Vault (Terraform only)
 ├── tests/
-│   ├── test_bronze.py              # PySpark Bronze unit tests
-│   └── test_silver.py              # PySpark Silver unit tests
-└── docs/
-    ├── architecture.md
-    ├── azure_setup.md
-    └── data_dictionary.md
+│   ├── test_bronze_transform.py  # Unit tests: flatten, dedup, DQ split
+│   └── test_silver_aggregate.py # Unit tests: enrichment, pivot, device count
+└── sample_data/
+    └── raw/                    # Sample JSON files for local testing
 ```
 
 ---
-
-## Module Explanation (Deep Dive)
-
-This section explains every module in `src/` with purpose, input → output, and why it exists in a production pipeline.
-
----
-
-### `src/extract/load_raw.py` — `load_raw(spark, target_date, raw_base_path)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Read raw JSON files from the Data Lake for a specific `_load_date` partition |
-| **Input** | `raw_base_path/_load_date={target_date}/*.json` on Azure Blob |
-| **Output** | PySpark DataFrame with all fields including `_id`, `_source.*`, `_load_date` |
-| **Why it exists** | The Raw layer is schema-on-read. PySpark infers the schema at read time. Partition pruning (`_load_date=...`) ensures only the target date is read — no full Data Lake scans in production. Without this, incremental reads would not be possible. |
-| **Production note** | Path includes `_load_date={target_date}` virtual path prefix. Azure Blob uses this for partition pruning even before Spark reads the file. |
-
----
-
-### `src/bronze/flatten_source.py` — `flatten_source(df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Promote Elasticsearch `_source` nested fields to top-level columns, and explicitly retain `_id` |
-| **Input** | DataFrame with columns: `_id`, `_source` (struct), `_load_date` |
-| **Output** | DataFrame with columns: `_id`, `Contract`, `Mac`, `TotalDuration`, `AppName`, `_load_date` |
-| **Why it exists** | Elasticsearch nests all business fields under `_source`. Downstream PySpark operations (groupBy, cast, join) require flat column names. `_id` must be explicitly retained — it is the deduplication key. Without flattening, every Bronze operation would reference `_source.FieldName`, which is verbose, error-prone, and incompatible with JDBC writes that expect flat column names. |
-| **Critical detail** | The explicit `select("_id", "_source.Contract", ...)` pattern is required. A bare `df.select("_source.*")` would promote all `_source` fields but silently drop `_id` since it lives outside `_source`. `_id` is always at the document root. |
-
----
-
-### `src/bronze/deduplicate_and_cast.py` — `deduplicate_and_cast(df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Remove duplicate document IDs from the load batch and enforce correct column types |
-| **Input** | Flat DataFrame with `Contract`, `Mac`, `TotalDuration` (String), `AppName`, `_id` |
-| **Output** | Deduplicated DataFrame with typed columns: `TotalDuration` (Integer), `Contract` (String), `Mac` (String) |
-| **Why it exists** | Elasticsearch can emit duplicate `_id` values under heavy indexing load or during shard rebalancing. Without deduplication, the same viewing session is counted twice in every KPI — inflating DAU, total duration, and all downstream aggregates. Type casting is required because JSON reads all numeric values as strings by default; using string-typed `TotalDuration` in `SUM()` either silently fails or produces incorrect results depending on Spark config. |
-| **Edge case** | If two rows have the same `_id` but different payloads (rare: Elasticsearch update in-flight during export), `dropDuplicates` keeps the first occurrence. This is intentional — the export timestamp determines which version is authoritative. |
-
----
-
-### `src/bronze/quarantine.py` — `quarantine(valid_df, invalid_df, jdbc_url, table)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Split a raw DataFrame into valid records (→ Bronze table) and invalid records (→ quarantine table) |
-| **Input** | `valid_df`: rows passing all DQ checks; `invalid_df`: rows failing checks, with `error_reason` column |
-| **Output** | Two DataFrames written to PostgreSQL: `raw_kplus_log` and `bronze_kplus_log_rejected` |
-| **Why it exists** | Zero data loss policy: no record is silently dropped. Every rejected row is preserved with its raw payload and the reason it was rejected. This enables manual audit, root-cause investigation, and one-click replay once the root cause is fixed. Without quarantine, a single bad record would block the entire pipeline — an unacceptable tradeoff at scale. |
-| **Schema of quarantine** | `bronze_kplus_log_rejected` mirrors `raw_kplus_log` plus `_raw_payload` (String: JSON of original row) and `error_reason` (VARCHAR). |
-
----
-
-### `src/silver/enrich_category.py` — `enrich_category(df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Map raw Elasticsearch app names to business-friendly Vietnamese content categories |
-| **Input** | Bronze DataFrame with `app_name` column (values: KPLUS, VOD, SPORT, etc.) |
-| **Output** | Bronze DataFrame with added `Type` column (values: Truyền Hình, Phim Truyện, Giải Trí, etc.) |
-| **Why it exists** | Raw app names are technical identifiers meaningless to business users. Embedding this logic in every downstream query (dbt model, Power BI report) duplicates business rules across the stack. Enriching once at Silver ensures all consumers share the same category definition — a single source of truth for content categorization. The `otherwise("Error")` bucket catches new app names not yet mapped, flagging them for the data team to handle before they pollute dashboards. |
-
----
-
-### `src/silver/calculate_devices.py` — `calculate_devices(df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Count the number of unique devices (distinct MAC addresses) per contract for the current load date |
-| **Input** | Bronze DataFrame with `Contract` and `Mac` columns |
-| **Output** | DataFrame with columns `Contract`, `TotalDevices` — one row per contract |
-| **Why it exists** | "Number of devices" is a key engagement and household signal. A contract with 5 devices is likely a family account with different usage patterns than a single-device contract. This metric directly feeds the Power BI device usage dashboard. Using `count(*)` without a prior `distinct()` on `(Contract, Mac)` would count total sessions, not unique devices — a fundamentally different and incorrect metric for this use case. |
-| **Grain** | One row per `Contract` per `_load_date`. A contract must appear in both the statistics DataFrame and this DataFrame to reach the final Silver table via the inner join in `finalize_result`. |
-
----
-
-### `src/silver/calculate_statistics.py` — `calculate_statistics(df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Compute total viewing duration per contract per content category, pivoted into wide format |
-| **Input** | Enriched Bronze DataFrame with `Contract`, `TotalDuration`, `Type` columns |
-| **Output** | DataFrame with `Contract` and one column per content category (e.g., `Truyền Hình`, `Phim Truyện`), each holding total seconds viewed |
-| **Why it exists** | Power BI dashboards need per-category duration as a filter and visual dimension. Pivot delivers this in one pass and one row per contract, which is the natural grain for the Silver fact table. The two-stage aggregation (sum then pivot) prevents overcounting: if a contract has 3 sessions in "Truyền Hình", summing session-level durations before pivoting gives the correct total. Pivoting raw rows would give the same result only if each (Contract, Type) pair appeared at most once — a condition that is not guaranteed and should not be assumed. |
-| **`na.fill(0)`** | New content categories or contracts with zero viewing time in a category produce `null` after pivot. Filling with `0` prevents `NULL + column = NULL` arithmetic errors in dbt and Power BI. |
-
----
-
-### `src/silver/finalize_result.py` — `finalize_result(statistics, total_devices, jdbc_url, table)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Join per-category statistics with device counts, then persist to Silver with partition-aware upsert |
-| **Input** | `statistics`: Contract × Category pivot; `total_devices`: Contract → TotalDevices |
-| **Output** | PostgreSQL table `silver_contract_stats` — one row per contract per `_load_date` |
-| **Why it exists** | This is the **write step** that materializes Silver. The inner join ensures only contracts with both statistics and device data reach the table. The partition-aware `DELETE + INSERT` pattern makes the write idempotent: re-running the same `_load_date` always produces the same final state without duplicates. |
-| **`batchsize=1000`** | JDBC batch inserts amortize the per-row round-trip cost. Without batching, 300K–600K individual INSERT statements per run would be prohibitively slow against PostgreSQL over the network. |
-| **`repartition`** | In production: write via JDBC with parallel partitions (Spark automatically partitions by the partition column). `repartition(1)` should only be used in local dev or single-file output scenarios — it forces all data through a single Spark task, eliminating parallelism. |
-
----
-
-### `src/gold/compute_kpis.py` — `compute_kpis(silver_summary_df)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Assemble the pre-computed Silver metrics into the Gold KPI fact table format consumed by dbt and Power BI |
-| **Input** | `silver_daily_summary` DataFrame (`_load_date`, `total_contracts`, `total_duration`, etc.) |
-| **Output** | DataFrame with schema matching `gold_kpi_metrics`: `date`, `total_dau`, `total_duration`, `avg_session_duration`, `active_contracts` |
-| **Why it exists** | dbt reads from `silver_daily_summary` (one row per date) rather than `silver_contract_stats` (one row per contract per date). This pre-aggregation at the Silver layer makes dbt models fast and simple — they only need to SELECT from Silver, not re-aggregate millions of contract rows on every run. The Gold layer's sole responsibility is renaming, casting, and applying the final business logic filter — not recomputing aggregations. |
-| **dbt boundary** | Any complex SQL KPI logic that is not pre-computed in Silver lives in `dbt/customer360/models/gold/gold_kpi_metrics.sql`. The Python `compute_kpis` stub is the handoff point; the actual Gold computation is expressed in dbt SQL for testability and lineage tracking. |
-
----
-
-### `src/validation/run_dq_checks.py` — `run_dq_checks(df, target_date)`
-
-| Item | Detail |
-|---|---|
-| **Purpose** | Run a defined suite of data quality checks on the Bronze DataFrame and surface metrics to Airflow via XComs |
-| **Input** | Bronze DataFrame (`raw_kplus_log` for target `_load_date`) |
-| **Output** | DQ report dict: `{total_rows, null_contract, null_mac, invalid_duration, duplicate_ids, rejection_rate}` |
-| **Why it exists** | Data quality is only actionable if it is measured. This function computes rejection rates and null counts per run, which are pushed to Airflow XComs and can be queried to build a DQ dashboard over time. A rising rejection rate is an early warning signal of source system issues — catching it in the Bronze run, before Silver or Gold, limits the blast radius to one partition. |
-| **Fail-open vs fail-closed** | This function is designed to **log and continue** (fail-open) for most checks, writing to quarantine rather than halting. However, a configurable `fail_on_excessive_rejections` flag can halt the pipeline if the rejection rate exceeds a threshold (e.g., > 5%), preventing a bad partition from polluting Silver. |
