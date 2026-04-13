@@ -1,452 +1,376 @@
-# Customer 360 — Hướng Dẫn Thực Thi Pipeline
+# Customer 360 — Triển Khai Pipeline Từng Bước
 
-> Tài liệu này hướng dẫn step-by-step cách tạo và chạy ELT pipeline từ dữ liệu thực tế trong `log_content/`. Mỗi bước tương ứng với một module code — bạn sẽ code từng module theo hướng dẫn.
-
----
-
-## Tổng Quan
-
-| Thông tin | Chi tiết |
-|---|---|
-| **Dữ liệu nguồn** | `log_content/` — 29 file NDJSON (~8 GB, ~46M records, tháng 4/2022) |
-| **Format** | Elasticsearch bulk export (NDJSON, 1 JSON object/dòng) |
-| **Pipeline** | Bronze → Silver → Gold (Medallion Architecture) |
-| **Storage local dev** | `data/` (thay thế ADLS Gen2) |
-| **Môi trường** | Python 3.10+, PySpark, Windows (dùng `e:/` path style) |
+> Tài liệu này hướng dẫn triển khai ELT pipeline từ dữ liệu thực tế. **Không code trước** — đọc và hiểu mỗi bước trước khi chuyển tiếp. Cấu trúc: **Phase → Module → Giải thích → Thực thi**.
 
 ---
 
-## Data Profile (Đã phân tích)
+## Tổng Quan Kiến Trúc
 
-### JSON Structure — mỗi record có 5 field top-level:
 ```
-_index, _type, _score, _id, _source
+log_content/*.json (29 file, ~8 GB)
+        │
+        ▼
+   ┌─────────┐
+   │  RAW    │  ← Bước 1: Tổ chức lại file gốc theo ngày (_load_date partition)
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │ BRONZE  │  ← Bước 2: Đọc JSON → Flatten → Cast type → Dedup → DQ gate → Parquet
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │ SILVER  │  ← Bước 3: Enrich AppName → Type → Pivot → Device count → Aggregate
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │  GOLD  │  ← Bước 4: Compute KPIs từ Silver → Bảng cuối cùng cho BI
+   └─────────┘
 ```
-### Trong `_source` — đúng 4 fields, KHÔNG có field nào khác:
-| Field | Type | Ví dụ |
-|---|---|---|
-| `Contract` | String (9 ký tự) | `"HNH579912"` |
-| `Mac` | String (12 hex) | `"0C96E62FC55C"` |
-| `TotalDuration` | Integer (giây) | `254` (range: 0–86400) |
-| `AppName` | String | `"CHANNEL"`, `"VOD"`, `"KPLUS"`, ... |
 
-### Data Quality Issues cần lưu ý:
-| Issue | Mức độ | Xử lý trong DQ |
-|---|---|---|
-| `Contract = "0"` | ~1k records/file | Treat as NULL → quarantine |
-| `TotalDuration = 0` | ~0.3–0.4% | Flag nhưng không reject (tune-in event) |
-| `TotalDuration = 86400` | Nhiều records | Ghi nhận, có thể cap 24h |
-| AppName shift mid-month (VOD → CHANNEL tăng mạnh) | Thay đổi nghiệp vụ | Không xử lý trong code |
+**Mỗi bước làm 1 việc duy nhất, độc lập. Chạy lại bất kỳ bước nào cho cùng 1 ngày → overwrite partition (idempotent).**
 
 ---
 
 ## Bước 0 — Chuẩn Bị Môi Trường
 
-### 0.1 Cài đặt Python dependencies
+### Mục đích
+Tạo cấu trúc thư mục sạch, cài đặt thư viện cần thiết.
 
+### Thư mục cần tạo
+```
+customer360-bigdata-pipeline/
+├── src/
+│   ├── scripts/        ← Bước 1: copy data vào raw
+│   ├── bronze/          ← Bước 2: load, transform, write
+│   ├── silver/          ← Bước 3: read, enrich, write
+│   └── dq/              ← Bước 2: DQ rule engine
+├── data/
+│   ├── raw/             ← Bước 1 ghi vào đây
+│   ├── bronze/          ← Bước 2 ghi vào đây
+│   ├── silver/          ← Bước 3 ghi vào đây
+│   └── gold/            ← Bước 4 ghi vào đây
+└── etl.py               ← Chạy tất cả bước 2-4 cho 1 hoặc nhiều ngày
+```
+
+### Cài đặt
 ```bash
 pip install pyspark findspark pandas python-dotenv
 ```
 
-### 0.2 Tạo cấu trúc thư mục
-
-Trong thư mục `customer360-bigdata-pipeline/`, tạo:
-
-```
-customer360-bigdata-pipeline/
-├── src/
-│   ├── bronze/
-│   ├── silver/
-│   └── dq/
-├── data/             ← sẽ chứa: raw/, bronze/, silver/, bronze_quarantine/, gold/
-└── etl.py            ← entry point
-```
+### Phase 0 checklist — chuyển tiếp khi:
+- [ ] Cấu trúc thư mục đúng như trên
+- [ ] `pip install` thành công
+- [ ] Spark chạy được (test: `pyspark --version`)
 
 ---
 
-## Bước 1 — Chuẩn Bị Raw Layer (Copy Dữ Liệu)
+## Bước 1 — Raw Layer (Tổ Chức File Nguồn)
 
-### Mục đích
-Tổ chức dữ liệu gốc từ `log_content/` vào cấu trúc partition `_load_date` theo đúng kiến trúc Medallion. File gốc tại `log_content` giữ nguyên.
+### 1.1 — Module `prepare_raw.py`
 
-### Logic
-- File `20220401.json` → copy vào `data/raw/_load_date=2022-04-01/20220401.json`
-- Parsing date từ filename: `YYYYMMDD` → `YYYY-MM-DD`
+**Mục đích:** Copy file JSON gốc từ `log_content/` vào `data/raw/`, tổ chức lại theo ngày.
 
-### File cần tạo: `src/scripts/prepare_raw.py`
-
-```python
-"""
-src/scripts/prepare_raw.py
-Copy JSON files from log_content/ into data/raw/ partitioned by _load_date.
-"""
-import shutil, os, glob
-
-LOG_DIR   = "e:/Study/Data Engineering/projects/customer360/log_content"
-RAW_BASE  = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/raw"
-
-for f in glob.glob(f"{LOG_DIR}/*.json"):
-    fname   = os.path.basename(f)            # "20220401.json"
-    date_str = fname.replace(".json", "")      # "20220401"
-    year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
-    load_date = f"{year}-{month}-{day}"       # "2022-04-01"
-    target_dir = f"{RAW_BASE}/_load_date={load_date}"
-    os.makedirs(target_dir, exist_ok=True)
-    shutil.copy2(f, f"{target_dir}/{fname}")
-    print(f"Copied {fname} -> {target_dir}/")
-
-print(f"Done. {len(glob.glob(f'{LOG_DIR}/*.json'))} files.")
+**Input:**
+```
+log_content/
+├── 20220401.json    (file nguồn Elasticsearch export)
+├── 20220402.json
+└── ...              (29 file, đặt tên theo ngày YYYYMMDD)
 ```
 
-### Chạy
+**Output:**
+```
+data/raw/
+└── _load_date=2022-04-01/
+│   └── 20220401.json      ← copy từ log_content/, KHÔNG transform
+└── _load_date=2022-04-02/
+    └── 20220402.json
+```
+
+**Giải thích:**
+- File gốc ở `log_content/` giữ nguyên — **không sửa, không xoá**
+- Mỗi file được copy vào thư mục `_load_date=YYYY-MM-DD` tương ứng
+- `_load_date` là **virtual partition key** — giúp Spark đọc đúng ngày mà không scan toàn bộ thư mục
+- `log_content/` là bản gốc bất biến — nếu Bronze/Silver logic thay đổi, đọc lại từ đây replay lại
+
+**Quy tắc đặt tên:**
+```
+filename: 20220401.json
+→ lấy 4 ký tự đầu  = năm  = 2022
+→ lấy 4 ký tự tiếp = tháng = 04
+→ lấy 4 ký tự tiếp = ngày   = 01
+→ ghép lại: _load_date=2022-04-01
+```
+
+**Chạy Bước 1:**
 ```bash
 python src/scripts/prepare_raw.py
 ```
 
-**Kết quả mong đợi:** 29 file được copy vào 29 partition `_load_date=YYYY-MM-DD/`
+### Bước 1 checklist — chuyển tiếp khi:
+- [ ] Tất cả 29 file đã copy vào `data/raw/_load_date=YYYY-MM-DD/`
+- [ ] File gốc ở `log_content/` vẫn còn nguyên
+- [ ] Mỗi ngày có đúng 1 file trong partition của nó
 
 ---
 
-## Bước 2 — Bronze Layer
+## Bước 2 — Bronze Layer (Làm Sạch Sơ Bộ)
 
-> Raw JSON → Bronze Parquet. Thực hiện: flatten, cast types, deduplicate, DQ split.
+> **Mục đích tổng quát:** Đọc JSON thô → flatten → cast type → dedup → chạy DQ rules → tách valid/invalid → lưu Parquet.
 
-### Cấu trúc thư mục output:
-```
-data/bronze/_load_date=2022-04-01/   → bronze_001.parquet
-data/bronze_quarantine/_load_date=2022-04-01/ → rejected_001.parquet
-```
+**Input:** `data/raw/_load_date=2022-04-01/*.json`
+**Output:** `data/bronze/_load_date=2022-04-01/` (valid) + `data/bronze_quarantine/` (invalid)
 
-### File 2.1: `src/bronze/load_raw.py`
+### 2.1 — Module `load_raw.py` — Đọc Raw JSON
 
-```python
-"""
-src/bronze/load_raw.py
-Read NDJSON from data/raw/_load_date={date}/ using PySpark.
-Flattens _source.*, retains _id and _load_date.
-"""
-import findspark
-findspark.init()
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, LongType
+**Mục đích:** Dùng PySpark đọc NDJSON, flatten `_source.*`, trả về DataFrame.
 
-RAW_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/raw"
-
-# Explicit schema — rejects type mismatches at read time
-SCHEMA = StructType([
-    StructField("Contract",      StringType(), True),
-    StructField("Mac",          StringType(), True),
-    StructField("TotalDuration",LongType(),  True),
-    StructField("AppName",       StringType(), True),
-    StructField("_id",           StringType(), False),  # ES doc ID — dedup key
-    StructField("_load_date",    StringType(), False),  # partition key
-])
-
-def load_raw(target_date: str):
-    spark = SparkSession.builder.appName("bronze_load").config("spark.driver.memory","8g").getOrCreate()
-    path = f"{RAW_BASE}/_load_date={target_date}/*.json"
-    df = spark.read.schema(SCHEMA).json(path, multiLine=False)
-    # Normalize column names to lowercase
-    for col_name in ["Contract","Mac","TotalDuration","AppName"]:
-        df = df.withColumnRenamed(col_name, col_name.lower())
-    return df, spark
+**Input thực tế (1 dòng trong file JSON):**
+```json
+{"_index":"tv_logs","_type":"_doc","_score":1,"_id":"abc123",
+ "_source":{"Contract":"HNH579912","Mac":"0C96E62FC55C","TotalDuration":254,"AppName":"CHANNEL"}}
 ```
 
-### File 2.2: `src/dq/evaluate.py`
+**Vấn đề:** `_source` là object lồng bên trong. Spark đọc thẳng sẽ tạo cột `_source` là 1 column JSON string — không thể query trực tiếp.
 
-```python
-"""
-src/dq/evaluate.py
-DQ Rule Engine — evaluates rules, splits valid/invalid DataFrames,
-produces report, raises if rejection rate > threshold (fail-closed).
-"""
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, concat_ws, lit, when, coalesce
+**Giải pháp:** Đọc với schema cứng — Spark tự động flatten các trường top-level.
 
-class DQRule:
-    def __init__(self, name: str, predicate_fn):
-        self.name = name
-        self.predicate_fn = predicate_fn
+**Schema cứng khai báo trong code:**
+| Column trong Spark | Type | Nguồn |
+|---|---|---|
+| `Contract` | String | `_source.Contract` |
+| `Mac` | String | `_source.Mac` |
+| `TotalDuration` | Long | `_source.TotalDuration` |
+| `AppName` | String | `_source.AppName` |
+| `_id` | String | `_id` (root level — dedup key) |
+| `_load_date` | String | Từ partition path |
 
-def not_null(col_name: str) -> DQRule:
-    """contract/mac/total_duration NOT NULL"""
-    def predicate(df: DataFrame) -> DataFrame:
-        return df.select(when(col(col_name).isNotNull(), True).otherwise(False).alias("ok"))
-    return DQRule(f"not_null_{col_name}", predicate)
+**Tại sao schema cứng?**
+- Sai type → Spark reject ngay lúc đọc, không phải sau khi đọc xong
+- pandas đọc được nhưng silently coerce sai → không phát hiện lỗi type
+- PySpark + schema cứng = **early failure, không có data corruption**
 
-def non_negative(col_name: str) -> DQRule:
-    """total_duration >= 0"""
-    def predicate(df: DataFrame) -> DataFrame:
-        return df.select(when(col(col_name) >= 0, True).otherwise(False).alias("ok"))
-    return DQRule(f"non_negative_{col_name}", predicate)
-
-def evaluate(df: DataFrame, rules: list, max_rejection_rate: float = 0.05):
-    violations_exprs = []
-    for rule in rules:
-        violations_exprs.append(
-            when(~rule.predicate_fn(df).select("ok").collect()[0]["ok"], lit(rule.name))
-            .otherwise(lit(None))
-        )
-
-    # invalid_df: rows with at least one violation
-    invalid_df = df.withColumn(
-        "_error_reason",
-        concat_ws(" | ", *[coalesce(e, lit("")) for e in violations_exprs])
-    ).filter(col("_error_reason") != lit(""))
-
-    # valid_df: rows with NO violations (anti-join on _id)
-    invalid_ids = invalid_df.select("_id").distinct()
-    valid_df = df.join(invalid_ids, on="_id", how="left_anti")
-
-    total = df.count()
-    invalid_n = invalid_df.count()
-    rate = invalid_n / total if total > 0 else 0.0
-
-    report = {
-        "total": total, "valid": total - invalid_n, "invalid": invalid_n,
-        "rate": rate, "threshold": max_rejection_rate,
-        "exceeded": rate > max_rejection_rate
-    }
-    return valid_df, invalid_df, report
-```
-
-### File 2.3: `src/bronze/transform.py`
-
-```python
-"""
-src/bronze/transform.py
-Bronze transformation: cast types, dedup by _id, run DQ.
-Returns (valid_df, invalid_df, dq_report).
-"""
-from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType
-
-def cast_and_dedup(df):
-    return (
-        df.withColumn("total_duration", df["totalduration"].cast(IntegerType()))
-           .withColumn("contract",       df["contract"].cast("string"))
-           .withColumn("mac",           df["mac"].cast("string"))
-           .drop("totalduration")
-           .dropDuplicates(["_id"])
-    )
-
-def transform(df):
-    from src.dq.evaluate import not_null, non_negative, evaluate
-    rules = [
-        not_null("contract"),
-        not_null("mac"),
-        not_null("total_duration"),
-        non_negative("total_duration"),
-    ]
-    valid, invalid, report = evaluate(df, rules)
-    if report["exceeded"]:
-        raise RuntimeError(
-            f"DQ rejection rate {report['rate']:.2%} > threshold {report['threshold']:.2%}"
-        )
-    return valid, invalid, report
-```
-
-### File 2.4: `src/bronze/write.py`
-
-```python
-"""
-src/bronze/write.py
-Write valid + invalid DataFrames to Parquet.
-Idempotent: mode="overwrite" on _load_date partition.
-"""
-BRONZE_BASE    = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/bronze"
-QUARANTINE_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/bronze_quarantine"
-
-def write_bronze(valid_df, invalid_df, target_date):
-    valid_path   = f"{BRONZE_BASE}/_load_date={target_date}/"
-    quarantine_path = f"{QUARANTINE_BASE}/_load_date={target_date}/"
-
-    valid_df.write.mode("overwrite").partitionBy("_load_date").parquet(valid_path)
-    invalid_df.write.mode("overwrite").partitionBy("_load_date").parquet(quarantine_path)
-    print(f"[{target_date}] Bronze -> {valid_path}")
-    print(f"[{target_date}] Quarantine -> {quarantine_path}")
-```
-
-### Verify Bronze (sau khi code xong)
-```python
-# Trong PySpark shell hoặc script
-df = spark.read.parquet("data/bronze/_load_date=2022-04-01/")
-print(f"Records: {df.count()}")
-df.printSchema()
-df.show(5)
-```
+**Output:** PySpark DataFrame với 6 columns đã flatten, đúng kiểu.
 
 ---
 
-## Bước 3 — Silver Layer
+### 2.2 — Module `evaluate.py` — DQ Engine (Data Quality)
 
-> Bronze Parquet → Silver Parquet. Thực hiện: AppName → Type enrichment, pivot, device count.
+**Mục đích:** Kiểm tra DQ rules trên DataFrame, tách valid rows / invalid rows.
 
-### Cấu trúc thư mục output:
-```
-data/silver/contract_stats/_load_date=2022-04-01/   → contract_stats.parquet
-data/silver/daily_summary/_load_date=2022-04-01/   → daily_summary.parquet
-```
+**Rules cần kiểm tra (4 rules):**
+| Rule | Logic |
+|---|---|
+| `not_null_contract` | `contract IS NOT NULL` |
+| `not_null_mac` | `mac IS NOT NULL` |
+| `not_null_total_duration` | `total_duration IS NOT NULL` |
+| `non_negative_total_duration` | `total_duration >= 0` |
 
-### File 3.1: `src/silver/read_bronze.py`
+**Các vấn đề dữ liệu thực tế đã phát hiện:**
+| Issue | Xử lý |
+|---|---|
+| `Contract = "0"` (~1k records/file) | Treat as NULL → quarantine |
+| `TotalDuration = 0` (~0.3–0.4%) | Flag nhưng giữ lại (tune-in event) |
+| `TotalDuration = 86400` (24h) | Ghi nhận, không reject |
 
-```python
-"""
-src/silver/read_bronze.py
-Read Bronze Parquet for exactly one _load_date partition.
-"""
-from pyspark.sql import SparkSession
+**DQ Engine trả về 3 thứ:**
+1. `valid_df` — rows pass ALL rules
+2. `invalid_df` — rows fail ≥1 rule, có thêm column `_error_reason` (ghi lý do fail)
+3. `report` — dict: total, valid, invalid, rate, threshold
 
-BRONZE_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/bronze"
+**Fail-closed (ngưỡng DQ):**
+- Nếu `rejection_rate > 5%` (mặc định) → pipeline **DỪNG**, không cho qua Bronze
+- Lý do: tỷ lệ lỗi cao bất thường = issue từ source system, không phải pipeline bug. Viết polluted data vào Silver → Gold KPIs sai hoàn toàn.
+- Nếu `< 5%` → viết cả valid và invalid, pipeline tiếp tục.
 
-def read_bronze(target_date: str):
-    spark = SparkSession.builder.appName("silver").config("spark.driver.memory","8g").getOrCreate()
-    path = f"{BRONZE_BASE}/_load_date={target_date}/"
-    return spark.read.parquet(path), spark
-```
-
-### File 3.2: `src/silver/enrich_and_aggregate.py`
-
-```python
-"""
-src/silver/enrich_and_aggregate.py
-Single-step Silver:
-  1. Enrich: AppName → Type
-  2. Two-stage pivot: Duration by contract × category
-  3. Distinct MAC count per contract
-  4. Platform-level unique devices (from raw bronze rows — NOT sum of contract)
-  5. Daily summary at date grain
-"""
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, countDistinct, sum as spark_sum, lit, create_map
-from itertools import chain
-
-BRONZE_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/bronze"
-
-TYPE_MAP = {
-    "CHANNEL":"Truyền Hình", "DSHD":"Truyền Hình",
-    "KPLUS":"Truyền Hình",  "KPlus":"Truyền Hình",
-    "VOD":"Phim Truyện",     "FIMS_RES":"Phim Truyện",
-    "BHD_RES":"Phim Truyện", "VOD_RES":"Phim Truyện",
-    "FIMS":"Phim Truyện",    "BHD":"Phim Truyện",
-    "DANET":"Phim Truyện",
-    "RELAX":"Giải Trí",
-    "CHILD":"Thiếu Nhi",
-    "SPORT":"Thể Thao",
-}
-
-def enrich_and_aggregate(bronze_df, target_date):
-    # 1. Enrich AppName → Type
-    type_expr = create_map([lit(x) for x in chain(*TYPE_MAP.items())])
-    enriched = bronze_df.withColumn("type", type_expr[col("app_name")])
-
-    # 2. Two-stage pivot: Stage1 sum duration per contract×type, Stage2 pivot on type
-    interim = enriched.groupBy("contract","type").agg(spark_sum("total_duration").alias("dur_cat"))
-    statistics = interim.groupBy("contract").pivot("type").agg(spark_sum("dur_cat")).fillna(0)
-
-    # 3. Distinct MAC per contract
-    device_counts = enriched.groupBy("contract").agg(countDistinct("mac").alias("total_devices"))
-
-    # 4. Join contract stats + devices
-    contract_stats = statistics.join(device_counts, on="contract", how="inner")
-    contract_stats = contract_stats.withColumn("_load_date", lit(target_date))
-
-    # 5. Platform-level unique devices (NOT sum — countDistinct from ALL bronze rows)
-    platform_devices = (
-        bronze_df.filter(col("_load_date") == target_date)
-                .agg(countDistinct("mac").alias("unique_devices"))
-                .withColumn("_load_date", lit(target_date))
-    )
-
-    # 6. Daily summary
-    numeric_cols = [c for c in contract_stats.columns
-                    if c not in ("contract","_load_date")
-                    and contract_stats.schema[c].dataType.typeName() in ("integer","long","double")]
-    daily = (
-        contract_stats
-        .select(
-            spark_sum(coalesce(col(c), lit(0)) for c in numeric_cols).alias("total_duration"),
-            countDistinct(col("contract")).alias("active_contracts"),
-        )
-    )
-    daily = daily.withColumn("_load_date", lit(target_date))
-    daily = daily.join(platform_devices, on="_load_date", how="left")
-    daily = daily.withColumn("avg_session_duration", (col("total_duration") / col("active_contracts")).cast("double"))
-    daily = daily.select("_load_date","total_duration","active_contracts","avg_session_duration","unique_devices")
-
-    return contract_stats, daily
-```
-
-### File 3.3: `src/silver/write_silver.py`
-
-```python
-"""
-src/silver/write_silver.py
-Write Silver outputs to Parquet.
-"""
-SILVER_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/silver"
-
-def write_silver(contract_stats, daily_summary, target_date):
-    stats_path   = f"{SILVER_BASE}/contract_stats/_load_date={target_date}/"
-    summary_path = f"{SILVER_BASE}/daily_summary/_load_date={target_date}/"
-    contract_stats.write.mode("overwrite").partitionBy("_load_date").parquet(stats_path)
-    daily_summary.write.mode("overwrite").partitionBy("_load_date").parquet(summary_path)
-    print(f"[{target_date}] Contract stats -> {stats_path}")
-    print(f"[{target_date}] Daily summary -> {summary_path}")
-```
-
-### Verify Silver (sau khi code xong)
-```python
-# Contract stats
-spark.read.parquet("data/silver/contract_stats/_load_date=2022-04-01/").printSchema()
-spark.read.parquet("data/silver/contract_stats/_load_date=2022-04-01/").show(5)
-
-# Daily summary
-spark.read.parquet("data/silver/daily_summary/_load_date=2022-04-01/").show(truncate=False)
-```
+**Output:** valid_df + invalid_df + dq_report
 
 ---
 
-## Bước 4 — Gold Layer (SQL / KPIs)
+### 2.3 — Module `transform.py` — Transform Logic
 
-### Mục đích
-Tạo bảng KPIs cuối cùng từ `daily_summary`. Ở local dev, dùng Spark để compute + save CSV. Production: dùng dbt + Synapse Serverless SQL.
+**Mục đích:** Gọi `load_raw` → `cast types` → `dedup` → `DQ evaluate` → trả về (valid, invalid, report).
 
-### File 4.1: `src/gold/compute_gold.py`
-
-```python
-"""
-src/gold/compute_gold.py
-Read silver/daily_summary → compute Gold KPIs → save CSV.
-"""
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
-
-SILVER_BASE = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/silver"
-GOLD_BASE   = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline/data/gold"
-
-def run_gold(target_date: str):
-    spark = SparkSession.builder.appName("gold").config("spark.driver.memory","4g").getOrCreate()
-    df = spark.read.parquet(f"{SILVER_BASE}/daily_summary/_load_date={target_date}/*.parquet")
-    gold = df.select(
-        col("_load_date").cast("date").alias("date"),
-        col("active_contracts").alias("total_dau"),
-        col("total_duration"),
-        col("avg_session_duration"),
-        col("active_contracts"),
-        col("unique_devices"),
-    )
-    gold_path = f"{GOLD_BASE}/gold_kpi_metrics/_load_date={target_date}/"
-    os.makedirs(gold_path, exist_ok=True)
-    gold.coalesce(1).write.mode("overwrite").option("header",True).csv(gold_path)
-    print(f"[{target_date}] Gold KPIs -> {gold_path}")
-    gold.show(truncate=False)
-    spark.stop()
+**Pipeline bên trong:**
+```
+Raw DataFrame
+  │
+  ├── Cast: "TotalDuration" (String) → Long
+  ├── Cast: "Contract" → String
+  ├── Cast: "Mac" → String
+  ├── Rename: lowercase (Spark convention)
+  ├── Dedup: dropDuplicates(["_id"])   ← loại bỏ trùng từ ES export
+  │
+  ▼
+DQ Engine (evaluate)
+  │
+  ├── valid_df   → đi vào bronze/
+  ├── invalid_df → đi vào bronze_quarantine/
+  └── report     → console log
 ```
 
-### Gold KPI Schema (tham khảo cho Synapse production)
+**Tại sao dedup bằng `_id`?**
+- `_id` là document ID gốc từ Elasticsearch
+- Cùng 1 record có thể xuất hiện 2 lần nếu ES export chạy lại
+- Nếu không dedup → Silver aggregate sai (double count)
 
-| Column | Type | Description |
+---
+
+### 2.4 — Module `write.py` — Ghi Bronze Parquet
+
+**Mục đích:** Ghi valid rows + invalid rows vào Parquet, theo partition `_load_date`.
+
+**Output thực tế:**
+```
+data/bronze/_load_date=2022-04-01/
+└── part-*.parquet         ← valid records (Parquet format)
+
+data/bronze_quarantine/_load_date=2022-04-01/
+└── part-*.parquet         ← invalid records (có column _error_reason)
+```
+
+**Schema Bronze (output):**
+| Column | Type | Mô tả |
+|---|---|---|
+| `contract` | String | |
+| `mac` | String | |
+| `total_duration` | Long | Giây xem |
+| `app_name` | String | App name (CHANNEL, VOD...) |
+| `_id` | String | ES doc ID — dedup key |
+| `_load_date` | String | Partition key |
+
+**Schema Quarantine (output):** cùng schema + thêm `_error_reason`
+
+**Write mode:** `overwrite` — chạy lại cùng ngày → replace hoàn toàn, không trùng.
+
+### Bước 2 checklist — chuyển tiếp khi:
+- [ ] Bronze Parquet đọc được (verify: `spark.read.parquet("data/bronze/_load_date=2022-04-01/").count()`)
+- [ ] DQ report rate < 5%
+- [ ] Quarantine có records (nếu có Contract="0" trong data)
+- [ ] Không có duplicate `_id` trong Bronze
+
+---
+
+## Bước 3 — Silver Layer (Làm Giàu Nghiệp Vụ)
+
+> **Mục đích tổng quát:** Đọc Bronze Parquet → gắn AppName vào Type (danh mục nội dung) → pivot duration → đếm device → aggregate theo ngày.
+
+**Input:** `data/bronze/_load_date=2022-04-01/*.parquet`
+**Output:**
+- `data/silver/contract_stats/_load_date=2022-04-01/` — grain: contract × ngày
+- `data/silver/daily_summary/_load_date=2022-04-01/` — grain: ngày (platform-level)
+
+### 3.1 — Module `read_bronze.py` — Đọc Bronze
+
+**Mục đích:** Đọc Bronze Parquet cho đúng 1 ngày, trả về DataFrame.
+
+**Rất đơn giản:** 1 dòng Spark read parquet, scoped vào `_load_date` cụ thể.
+- Đọc đúng 1 partition ngày, không scan toàn bộ Bronze
+- Không bao giờ đọc từ Raw trực tiếp
+
+---
+
+### 3.2 — Module `enrich_and_aggregate.py` — Enrichment + Aggregation
+
+**Mục đích:** Tất cả business logic Silver trong 1 bước.
+
+**Bước 1: Enrich — AppName → Type (danh mục nội dung)**
+
+| AppName | Type (loại nội dung) |
+|---|---|
+| CHANNEL, DSHD, KPLUS, KPlus | **Truyền Hình** |
+| VOD, FIMS, FIMS_RES, BHD, BHD_RES, VOD_RES, DANET | **Phim Truyện** |
+| RELAX | **Giải Trí** |
+| CHILD | **Thiếu Nhi** |
+| SPORT | **Thể Thao** |
+
+Enrichment thêm column `type` vào DataFrame — để downstream query theo danh mục nội dung thay vì app name rời rạc.
+
+**Bước 2: Pivot Duration (Two-stage)**
+
+```
+Stage 1: GroupBy(contract, type) → SUM(total_duration) → dur_cat
+Stage 2: GroupBy(contract) → Pivot(type) → SUM(dur_cat) → fillna(0)
+```
+
+Tại sao 2 stage mà không pivot trực tiếp?
+- 1 contract có thể có nhiều session cùng loại nội dung trong 1 ngày
+- Pivot trực tiếp = mỗi cell là 1 aggregate duy nhất → không handle được sum-then-pivot đúng
+- Two-stage: sum theo (contract, type) trước → rồi pivot → mỗi contract có đúng 1 row
+
+**Output Stage 2 (mỗi contract 1 row, mỗi type 1 column):**
+```
+contract | Truyền Hình | Phim Truyện | Giải Trí | Thiếu Nhi | Thể Thao | _load_date
+HNH579912 | 1250       | 430        | 0        | 0         | 0        | 2022-04-01
+```
+
+**Bước 3: Đếm Device**
+
+```
+GroupBy(contract) → COUNT(DISTINCT mac) → total_devices
+```
+
+Mỗi contract có thể xem trên nhiều thiết bị (TV, phone, tablet) → đếm distinct MAC.
+
+**Bước 4: Platform-level Device Count**
+
+```
+COUNT(DISTINCT mac) từ TOÀN BỘ Bronze rows (1 ngày)
+```
+
+**QUAN TRỌNG:** Đếm trực tiếp từ Bronze rows — KHÔNG SUM(`total_devices`) vì:
+- 1 thiết bị (MAC) có thể gắn với nhiều contract
+- SUM(contract-level) → double count thiết bị → KPI `unique_devices` sai
+
+**Bước 5: Daily Summary (platform-level)**
+
+```
+Từ contract_stats (tất cả contracts trong ngày)
+→ SUM(tất cả duration columns)  → total_duration
+→ COUNT(DISTINCT contract)     → active_contracts
+→ JOIN platform_devices        → unique_devices
+→ total_duration / active_contracts → avg_session_duration
+```
+
+Output: **1 row duy nhất cho mỗi ngày** (date grain).
+
+---
+
+### 3.3 — Module `write_silver.py` — Ghi Silver Parquet
+
+**Mục đích:** Ghi 2 bảng Silver ra Parquet.
+
+**Output thực tế:**
+```
+data/silver/contract_stats/_load_date=2022-04-01/
+└── part-*.parquet         ← grain: contract × ngày (nhiều rows)
+
+data/silver/daily_summary/_load_date=2022-04-01/
+└── part-*.parquet         ← grain: ngày (1 row/ngày)
+```
+
+### Bước 3 checklist — chuyển tiếp khi:
+- [ ] `contract_stats` có đúng nhiều rows (mỗi contract 1 row)
+- [ ] `daily_summary` có đúng 1 row cho ngày đó
+- [ ] `unique_devices` ≠ SUM(`total_devices`)
+- [ ] `fillna(0)` đã apply đúng (không có null trong duration columns)
+
+---
+
+## Bước 4 — Gold Layer (KPIs Cuối Cùng)
+
+> **Mục đích tổng quát:** Đọc `daily_summary` → compute KPIs → lưu CSV/Parquet cho Power BI.
+
+**Input:** `data/silver/daily_summary/_load_date=2022-04-01/*.parquet`
+**Output:** `data/gold/gold_kpi_metrics/_load_date=2022-04-01/` (CSV)
+
+### 4.1 — Module `compute_gold.py` — KPI Computation
+
+**Mục đích:** Đọc Silver `daily_summary`, rename/cast columns, save final KPIs.
+
+**KPIs output (bảng cuối cùng cho BI):**
+
+| Column | Type | Mô tả |
 |---|---|---|
 | `date` | DATE | Ngày |
 | `total_dau` | INTEGER | Số contract distinct — DAU |
@@ -455,153 +379,94 @@ def run_gold(target_date: str):
 | `active_contracts` | INTEGER | Số contract active |
 | `unique_devices` | BIGINT | Số device distinct (platform-level) |
 
----
+**Gold layer là giao diện ổn định (stable contract):**
+- BI (Power BI) chỉ đọc từ bảng này
+- Không bao giờ query Bronze/Silver trực tiếp từ BI
+- Nếu logic Silver thay đổi → update Gold → BI không bị break
 
-## Bước 5 — Entry Point: `etl.py`
-
-```python
-"""
-etl.py — Customer 360 ELT Pipeline Entry Point
-Hỗ trợ 3 mode: incremental, date_range, full
-"""
-import argparse, glob, os, sys
-from datetime import datetime, timedelta
-
-PROJECT_ROOT = "e:/Study/Data Engineering/projects/customer360/customer360-bigdata-pipeline"
-sys.path.insert(0, PROJECT_ROOT)
-
-# ─── Modes ────────────────────────────────────────────────────────────────────
-# incremental  → xử lý 1 ngày (default: yesterday, hoặc --date YYYY-MM-DD)
-# date_range   → xử lý từ --start đến --end (inclusive)
-# full         → xử lý tất cả _load_date trong data/raw/
-
-# ─── Chạy 1 ngày ──────────────────────────────────────────────────────────────
-# python etl.py --mode incremental --date 2022-04-01
-#
-# ─── Chạy 5 ngày đầu ─────────────────────────────────────────────────────────
-# python etl.py --mode date_range --start 2022-04-01 --end 2022-04-05
-#
-# ─── Chạy full (29 ngày) ──────────────────────────────────────────────────────
-# python etl.py --mode full
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode",  choices=["incremental","date_range","full"], default="incremental")
-    parser.add_argument("--date")
-    parser.add_argument("--start")
-    parser.add_argument("--end")
-    args = parser.parse_args()
-
-    # Xác định danh sách ngày cần xử lý
-    if args.mode == "incremental":
-        dates = [args.date or (datetime.today() - timedelta(1)).strftime("%Y-%m-%d")]
-    elif args.mode == "date_range":
-        s = datetime.strptime(args.start, "%Y-%m-%d")
-        e = datetime.strptime(args.end,   "%Y-%m-%d")
-        dates = [(s + timedelta(i)).strftime("%Y-%m-%d") for i in range((e-s).days + 1)]
-    else:  # full
-        raw = PROJECT_ROOT + "/data/raw"
-        dates = sorted(
-            p.replace("_load_date=", "")
-            for p in glob.glob(f"{raw}/_load_date=????-??-??")
-        )
-
-    for target_date in dates:
-        print(f"\n{'='*50}\n  Processing: {target_date}  [{dates.index(target_date)+1}/{len(dates)}]\n{'='*50}")
-
-        # BRONZE
-        bronze_df, bronze_spark = src.bronze.load_raw.load_raw(target_date)
-        valid, invalid, report = src.bronze.transform.transform(bronze_df)
-        print(f"  DQ: valid={report['valid']}  invalid={report['invalid']}  rate={report['rate']:.4%}")
-        src.bronze.write.write_bronze(valid, invalid, target_date)
-        bronze_spark.stop()
-
-        # SILVER
-        silver_df, silver_spark = src.silver.read_bronze.read_bronze(target_date)
-        contract_stats, daily = src.silver.enrich_and_aggregate.enrich_and_aggregate(silver_df, target_date)
-        src.silver.write_silver.write_silver(contract_stats, daily, target_date)
-        silver_spark.stop()
-
-        # GOLD
-        src.gold.compute_gold.run_gold(target_date)
-
-        print(f"  ✓ {target_date} COMPLETE")
-
-if __name__ == "__main__":
-    main()
-```
+### Bước 4 checklist:
+- [ ] Gold output đọc được
+- [ ] 1 row cho mỗi ngày
+- [ ] `unique_devices` đúng (platform-level, không double count)
 
 ---
 
-## Bước 6 — Chạy Thực Tế
+## Bước 5 — Entry Point `etl.py`
 
-### 6.1 Test 1 ngày (2022-04-01)
+**Mục đích:** Kết nối tất cả module, chạy Bronze → Silver → Gold cho 1 hoặc nhiều ngày.
 
-```bash
-python etl.py --mode incremental --date 2022-04-01
-```
+### 3 chế độ chạy:
 
-### 6.2 Kiểm tra kết quả
-
-```python
-# Xem Bronze output
-spark.read.parquet("data/bronze/_load_date=2022-04-01/").count()
-spark.read.parquet("data/bronze/_load_date=2022-04-01/").show(5)
-
-# Xem Quarantine (DQ rejected)
-spark.read.parquet("data/bronze_quarantine/_load_date=2022-04-01/").count()
-
-# Xem Silver contract_stats
-spark.read.parquet("data/silver/contract_stats/_load_date=2022-04-01/").printSchema()
-
-# Xem Silver daily_summary
-spark.read.parquet("data/silver/daily_summary/_load_date=2022-04-01/").show(truncate=False)
-
-# Xem Gold KPIs
-import pandas as pd
-pd.read_csv("data/gold/gold_kpi_metrics/_load_date=2022-04-01/")
-```
-
-### 6.3 Test nhiều ngày (kiểm tra idempotency)
-
-```bash
-python etl.py --mode date_range --start 2022-04-01 --end 2022-04-05
-# Chạy lại lần 2 → kết quả phải giống hệt (idempotent)
-python etl.py --mode date_range --start 2022-04-01 --end 2022-04-05
-```
-
-### 6.4 Chạy full (29 ngày)
-
-```bash
-python etl.py --mode full
-```
-
----
-
-## Tổng Hợp File Cần Tạo
-
-| # | File | Mô tả |
+| Mode | Lệnh | Khi nào dùng |
 |---|---|---|
-| 1 | `src/scripts/prepare_raw.py` | Copy log_content → data/raw/ partition |
-| 2 | `src/dq/evaluate.py` | DQ rule engine |
-| 3 | `src/bronze/load_raw.py` | Spark read NDJSON, flatten _source |
-| 4 | `src/bronze/transform.py` | Cast types, dedup, DQ split |
-| 5 | `src/bronze/write.py` | Write parquet + quarantine |
-| 6 | `src/silver/read_bronze.py` | Read bronze parquet |
-| 7 | `src/silver/enrich_and_aggregate.py` | AppName→Type, pivot, device count |
-| 8 | `src/silver/write_silver.py` | Write silver parquet |
-| 9 | `src/gold/compute_gold.py` | Compute Gold KPIs từ daily_summary |
-| 10 | `etl.py` | Entry point: --mode incremental / date_range / full |
+| `incremental` | `python etl.py --mode incremental --date 2022-04-01` | Xử lý 1 ngày cụ thể |
+| `date_range` | `python etl.py --mode date_range --start 2022-04-01 --end 2022-04-05` | Backfill nhiều ngày |
+| `full` | `python etl.py --mode full` | Chạy lại toàn bộ 29 ngày |
+
+### Luồng bên trong `etl.py` cho mỗi ngày:
+```
+target_date = 2022-04-01
+
+  Bronze:
+    load_raw(target_date)         → DataFrame
+    transform(df)                 → valid, invalid, report
+    write_bronze(valid, invalid) → Parquet files
+
+  Silver:
+    read_bronze(target_date)      → DataFrame
+    enrich_and_aggregate(df)      → contract_stats, daily_summary
+    write_silver(stats, daily)    → Parquet files
+
+  Gold:
+    run_gold(target_date)         → KPI CSV
+```
+
+**Mỗi ngày chạy độc lập** — ngày này fail không ảnh hưởng ngày khác.
 
 ---
 
-## Thứ Tự Code/Thực Thi Đề Xuất
+## Tổng Hợp Triển Khai Theo Thứ Tự
 
 ```
-1. src/scripts/prepare_raw.py          → chạy 1 lần để copy data
-2. src/dq/evaluate.py                 → test độc lập
-3. src/bronze/ (load → transform → write) → test với 1 file nhỏ
-4. src/silver/ (read → enrich → write)   → test với 1 ngày
-5. src/gold/compute_gold.py           → test với 1 ngày
-6. etl.py                              → nối tất cả, chạy full
+[1] src/scripts/prepare_raw.py
+    → Copy 29 file vào data/raw/ partition theo ngày
+    → Chạy 1 LẦN DUY NHẤT
+
+[2] src/dq/evaluate.py
+    → DQ engine: rules → valid/invalid split
+    → Test độc lập trước khi tích hợp
+
+[3] src/bronze/ (load → transform → write)
+    → load_raw.py      : Spark đọc JSON, flatten
+    → transform.py     : cast, dedup, DQ split
+    → write.py         : ghi Parquet + quarantine
+    → Test với 1 ngày (2022-04-01)
+
+[4] src/silver/ (read → enrich → write)
+    → read_bronze.py              : đọc Bronze
+    → enrich_and_aggregate.py     : enrich + pivot + device count
+    → write_silver.py             : ghi 2 bảng Silver
+    → Test với 1 ngày (2022-04-01)
+
+[5] src/gold/compute_gold.py
+    → Đọc daily_summary → KPIs
+    → Test với 1 ngày (2022-04-01)
+
+[6] etl.py
+    → Kết nối tất cả module
+    → Test: incremental (1 ngày) → date_range (5 ngày) → full (29 ngày)
+```
+
+---
+
+## Triển Khai Checklist Toàn Pipeline
+
+```
+□ Bước 0: Tạo thư mục + pip install — DONE
+□ Bước 1: Chạy prepare_raw.py — 29 file vào data/raw/
+□ Bước 2: Bronze — verify count, DQ rate, quarantine
+□ Bước 3: Silver — verify contract_stats, daily_summary, unique_devices
+□ Bước 4: Gold — verify KPIs
+□ Bước 5: etl.py — chạy incremental → date_range → full
+□ Bonus: etl.py lần 2 (idempotency check — kết quả phải y hệt)
 ```
