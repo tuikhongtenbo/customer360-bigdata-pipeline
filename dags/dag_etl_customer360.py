@@ -11,7 +11,7 @@ os.environ["LOG_DIR"] = "/opt/airflow/log_content"
 
 from src.scripts.ingest_raw import ingest_raw
 from src.scripts.run_bronze import run_bronze
-from src.scripts.run_silver import run_silver
+# from src.scripts.run_silver import run_silver
 
 
 default_args = {
@@ -30,8 +30,8 @@ with DAG(
     def task_bronze(ds=None):
         run_bronze(ds)
 
-    def task_silver(ds=None):
-        run_silver(ds)
+    # def task_silver(ds=None):
+    #     run_silver(ds)
 
     def task_ingest_raw(ds=None):
         date_str = ds.split("T")[0] if "T" in str(ds) else str(ds)
@@ -40,6 +40,5 @@ with DAG(
 
     t1 = PythonOperator(task_id="ingest_raw", python_callable=task_ingest_raw)
     t2 = PythonOperator(task_id="bronze_transform", python_callable=task_bronze)
-    t3 = PythonOperator(task_id="silver_transform", python_callable=task_silver)
 
-    t1 >> t2 >> t3
+    t1 >> t2
