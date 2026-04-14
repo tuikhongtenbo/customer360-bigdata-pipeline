@@ -208,3 +208,19 @@ __marimo__/
 
 
 # dataset
+data/
+logs/
+airflow/
+*.csv
+*.parquet
+
+# Debug / test scripts
+test_*.py
+debug_*.py
+verify_*.py
+
+# dbt
+dbt/
+target/
+dbt_packages/
+logs/
