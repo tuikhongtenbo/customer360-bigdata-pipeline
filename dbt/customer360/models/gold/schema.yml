@@ -1,0 +1,159 @@
+version: 2
+
+models:
+  - name: gold_kpi_metrics
+    description: Daily platform KPIs aggregated from Silver daily_summary
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: date
+        description: Aggregation date
+        data_type: date
+        tests:
+          - not_null
+          - unique
+      - name: total_duration
+        description: Total platform viewing time in seconds
+        data_type: bigint
+        tests:
+          - not_null
+      - name: active_contracts
+        description: Number of active subscriber contracts
+        data_type: integer
+        tests:
+          - not_null
+      - name: unique_devices
+        description: Platform-level distinct devices
+        data_type: integer
+        tests:
+          - not_null
+      - name: avg_session_duration
+        description: Average viewing time per contract (seconds)
+        data_type: float
+        tests:
+          - not_null
+
+  - name: contract_most_watch
+    description: Most-watched content category per contract for each date
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: contract
+        tests:
+          - not_null
+      - name: date
+        data_type: date
+        tests:
+          - not_null
+      - name: most_watch
+        description: "Category label: Relax | Movie | Child | Sport | TV"
+
+  - name: contract_taste
+    description: Content categories watched by each contract (dash-joined)
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: contract
+        tests:
+          - not_null
+      - name: date
+        data_type: date
+        tests:
+          - not_null
+      - name: taste
+        description: "Dash-joined categories, e.g. 'Relax-Movie-TV' or 'TV'"
+
+  - name: contract_type
+    description: Usage level per contract per date based on total_duration quantiles
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: contract
+        tests:
+          - not_null
+      - name: date
+        data_type: date
+        tests:
+          - not_null
+      - name: total_duration
+        data_type: bigint
+      - name: type
+        description: "Low | Medium | High — Q1/Q3 quantile threshold"
+
+  - name: contract_activeness
+    description: Number of active days per contract (cumulative from Silver contract_stats)
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: contract
+        tests:
+          - not_null
+      - name: date
+        data_type: date
+        tests:
+          - not_null
+      - name: activeness
+        description: Count of distinct _load_date values for this contract
+        data_type: integer
+
+  - name: contract_clinginess
+    description: Customer segmentation per contract per date (Type × Activeness rules)
+    config:
+      schema: gold
+      materialized: incremental
+    columns:
+      - name: contract
+        tests:
+          - not_null
+      - name: date
+        data_type: date
+        tests:
+          - not_null
+      - name: type
+        description: "Low | Medium | High"
+      - name: activeness
+        data_type: integer
+      - name: clinginess
+        description: "Low | Medium | High — final segmentation"
+
+  - name: search_trending
+    description: Search keyword trending analysis — June vs July per user
+    config:
+      schema: gold
+      materialized: view
+    columns:
+      - name: user_id
+        description: User identifier
+        tests:
+          - not_null
+      - name: most_search_june
+        description: Top-1 keyword searched in June
+        tests:
+          - not_null
+      - name: category_june
+        description: Content category mapped from June keyword
+        tests:
+          - not_null
+      - name: most_search_july
+        description: Top-1 keyword searched in July
+        tests:
+          - not_null
+      - name: category_july
+        description: Content category mapped from July keyword
+        tests:
+          - not_null
+      - name: trending_type
+        description: "Changed | Unchanged — whether category shifted between months"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["Changed", "Unchanged"]
+      - name: previous
+        description: "Unchanged or 'category_june; category_july'"
+        tests:
+          - not_null
