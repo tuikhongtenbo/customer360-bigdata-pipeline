@@ -220,7 +220,6 @@ debug_*.py
 verify_*.py
 
 # dbt
-dbt/
-target/
-dbt_packages/
-logs/
+dbt/**/target/
+dbt/**/dbt_packages/
+dbt/**/logs/

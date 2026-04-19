@@ -45,14 +45,25 @@ services:
       AIRFLOW__WEBSERVER__SECRET_KEY: dev_secret_key
       AIRFLOW__WEBSERVER__RBAC: "True"
       AIRFLOW_UID: "50000"
-      _PIP_ADDITIONAL_REQUIREMENTS: "pyspark==3.5.0 findspark psycopg2-binary azure-storage-blob python-dotenv"
+      _PIP_ADDITIONAL_REQUIREMENTS: "pyspark==3.5.0 findspark psycopg2-binary azure-storage-blob python-dotenv duckdb dbt-synapse dbt-duckdb"
+      DBT_PROJECT_DIR: "/opt/airflow/dbt/customer360"
+      AZURE_TENANT_ID: "${AZURE_TENANT_ID}"
+      AZURE_CLIENT_ID: "${AZURE_CLIENT_ID}"
+      AZURE_CLIENT_SECRET: "${AZURE_CLIENT_SECRET}"
+      SYNAPSE_SERVER: "${SYNAPSE_SERVER}"
+      SYNAPSE_DATABASE: "${SYNAPSE_DATABASE}"
+    env_file:
+      - ../.env
     volumes:
       - ../dags:/opt/airflow/dags
       - ../src:/opt/airflow/src
       - ../data:/opt/airflow/data
       - ../logs:/opt/airflow/logs
       - ../.env:/opt/airflow/.env
+      - ../dbt:/opt/airflow/dbt
+      - ../dbt/customer360/profiles.yml:/home/airflow/.dbt/profiles.yml:ro
       - /e/Study/Data Engineering/projects/customer360/log_content:/opt/airflow/log_content
+      - /e/Study/Data Engineering/projects/customer360/log_search:/opt/airflow/log_search
 
     ports:
       - "8080:8080"
@@ -76,14 +87,25 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW_UID: "50000"
-      _PIP_ADDITIONAL_REQUIREMENTS: "pyspark==3.5.0 findspark psycopg2-binary azure-storage-blob python-dotenv"
+      _PIP_ADDITIONAL_REQUIREMENTS: "pyspark==3.5.0 findspark psycopg2-binary azure-storage-blob python-dotenv duckdb dbt-synapse dbt-duckdb"
+      DBT_PROJECT_DIR: "/opt/airflow/dbt/customer360"
+      AZURE_TENANT_ID: "${AZURE_TENANT_ID}"
+      AZURE_CLIENT_ID: "${AZURE_CLIENT_ID}"
+      AZURE_CLIENT_SECRET: "${AZURE_CLIENT_SECRET}"
+      SYNAPSE_SERVER: "${SYNAPSE_SERVER}"
+      SYNAPSE_DATABASE: "${SYNAPSE_DATABASE}"
+    env_file:
+      - ../.env
     volumes:
       - ../dags:/opt/airflow/dags
       - ../src:/opt/airflow/src
       - ../data:/opt/airflow/data
       - ../logs:/opt/airflow/logs
       - ../.env:/opt/airflow/.env
+      - ../dbt:/opt/airflow/dbt
+      - ../dbt/customer360/profiles.yml:/home/airflow/.dbt/profiles.yml:ro
       - /e/Study/Data Engineering/projects/customer360/log_content:/opt/airflow/log_content
+      - /e/Study/Data Engineering/projects/customer360/log_search:/opt/airflow/log_search
 
     command: scheduler
 

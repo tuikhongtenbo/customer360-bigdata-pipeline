@@ -9,10 +9,13 @@ apache-airflow==2.9.3
 
 # DB clients
 psycopg2-binary==2.9.9
-sqlalchemy==2.0.27
 
 # Azure SDK (production)
 azure-storage-blob==12.23.0
+
+# dbt adapters — version pinned by pip from previous install (dbt-core 1.11.x)
+dbt-synapse
+dbt-duckdb
 
 # Utilities
 python-dateutil==2.9.0
