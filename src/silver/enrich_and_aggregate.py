@@ -1,14 +1,20 @@
+import os as _os
 import sys
 sys.path.insert(0, "/opt/airflow")
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, sum as spark_sum, countDistinct, lit, when
+from pyspark.sql import DataFrame, Window
+from pyspark.sql.functions import (
+    col, sum as spark_sum, countDistinct, lit, when, concat_ws,
+    desc, rank, coalesce, count, substring
+)
+from pyspark.sql.window import Window as W
+from src.utils.azure_utils import get_blob_service, download_blobs
+
+from src.search.category_mapping import map_category
 
 
+# CONTENT PIPELINE — enrich + aggregate                         
 
-# Bước 1: Thêm column `type` vào DataFrame.
 def enrich(bronze_df: DataFrame) -> DataFrame:
-    # Dùng when().when()...otherwise() thay vì create_map
-    # create_map không chấp nhận duplicate keys (KPLUS=KPlus -> "Truyền Hình")
     type_expr = (
         when(col("app_name").isin("CHANNEL", "DSHD", "KPLUS", "KPlus"), "Truyền Hình")
         .when(col("app_name").isin("VOD", "FIMS", "FIMS_RES", "BHD", "BHD_RES", "VOD_RES", "DANET"), "Phim Truyện")
@@ -17,65 +23,11 @@ def enrich(bronze_df: DataFrame) -> DataFrame:
         .when(col("app_name") == "SPORT", "Thể Thao")
         .otherwise(lit("Khác"))
     )
-
-    df = bronze_df.withColumn("type", type_expr)
-
-    return df
+    return bronze_df.withColumn("type", type_expr)
 
 
-# Bước 2: Pivot duration + Đếm device + Platform summary.
 def aggregate(df: DataFrame, target_date: str) -> tuple:
-    """
-    Thực hiện 2 phép aggregate chính:
-      A. contract_stats  — grain: contract × ngày
-      B. daily_summary   — grain: ngày (1 row duy nhất)
-    """
-    # ───────────────────────────────────────────────────────────────
-    # A. STAGE 1: sum theo (contract, type) — trước khi pivot
-    # ───────────────────────────────────────────────────────────────
-    #
-    # bronze_df sau enrich (ví dụ 1 row):
-    #   contract=HNH579912 | total_duration=254 | type="Truyền Hình"
-    #   contract=HNH579912 | total_duration=430 | type="Phim Truyện"
-    #   contract=HUFD40665 | total_duration=1457| type="Truyền Hình"
-    #
-    # groupBy("contract", "type").sum("total_duration"):
-    #   HNH579912 | Truyền Hình | 254
-    #   HNH579912 | Phim Truyện | 430
-    #   HUFD40665 | Truyền Hình | 1457
-    #
-    # Tại sao phải sum TRƯỚC rồi pivot SAU?
-    #   - 1 contract có thể xem nhiều session cùng loại trong ngày
-    #   - nếu pivot trực tiếp: mỗi cell = 1 giá trị duy nhất
-    #     (Spark chỉ giữ lại row cuối cùng) → SAI
-    #   - sum trước → 1 row (contract, type) → rồi pivot → ĐÚNG
-
-    stage1 = (
-        df.groupBy("contract", "type")
-          .agg(spark_sum("total_duration").alias("duration_by_category"))
-    )
-
-    # ───────────────────────────────────────────────────────────────
-    # B. STAGE 2: pivot theo type — mỗi type thành 1 column
-    # ───────────────────────────────────────────────────────────────
-    #
-    # stage1 hiện tại:
-    #   HNH579912 | Truyền Hình | 254
-    #   HNH579912 | Phim Truyện | 430
-    #   HUFD40665 | Truyền Hình | 1457
-    #
-    # .pivot("type"):
-    #   - Lấy tất cả giá trị distinct trong column "type"
-    #   - Tạo 1 column mới cho mỗi giá trị: "Truyền Hình", "Phim Truyện", ...
-    #   - Mỗi cell = tổng duration theo category đó
-    #
-    # Kết quả (mỗi contract 1 row, mỗi type 1 column):
-    #   contract | Truyền Hình | Phim Truyện | Giải Trí | Thiếu Nhi | Thể Thao
-    #   HNH579912 | 254        | 430         | 0        | 0         | 0
-    #   HUFD40665 | 1457       | 0           | 0        | 0         | 0
-    #
-    # .fillna(0): cells không có loại hình đó → null → fill thành 0
-    #   Lý do: null + số = null trong dbt SQL → fillna(0) phòng ngừa
+    stage1 = df.groupBy("contract", "type").agg(spark_sum("total_duration").alias("duration_by_category"))
 
     contract_stats = (
         stage1.groupBy("contract")
@@ -85,81 +37,15 @@ def aggregate(df: DataFrame, target_date: str) -> tuple:
               .withColumn("_load_date", lit(target_date))
     )
 
-    # ───────────────────────────────────────────────────────────────
-    # C. Đếm thiết bị (MAC) theo contract
-    # ───────────────────────────────────────────────────────────────
-    #
-    # Mỗi contract có thể xem trên nhiều thiết bị (TV, phone, tablet)
-    # → Đếm số MAC distinct theo contract
-    #
-    # bronze_df gốc (1 contract, nhiều row):
-    #   contract=HNH579912 | mac=0C96E62FC55C
-    #   contract=HNH579912 | mac=0C96E62FC55C  ← cùng MAC, khác session
-    #   contract=HNH579912 | mac=D46A6A7AC6E3  ← MAC khác (thiết bị 2)
-    #
-    # groupBy("contract").agg(countDistinct("mac")):
-    #   HNH579912 | 2
-
-    device_count = (
-        df.groupBy("contract")
-          .agg(countDistinct("mac").alias("total_devices"))
-    )
-
-    # Join contract_stats (pivot result) với device_count
-    # contract_stats có column "contract"
-    # device_count có column "contract"
-    # → inner join: mỗi contract có thêm column total_devices
+    device_count = df.groupBy("contract").agg(countDistinct("mac").alias("total_devices"))
     contract_stats = contract_stats.join(device_count, on="contract", how="inner")
 
-    # ───────────────────────────────────────────────────────────────
-    # D. Platform-level device count
-    # ───────────────────────────────────────────────────────────────
-    #
-    # QUAN TRỌNG: Đếm trực tiếp từ TOÀN BỘ bronze rows (1 ngày)
-    # KHÔNG SUM("total_devices") vì:
-    #   - 1 MAC có thể gắn với nhiều contract (chia sẻ thiết bị)
-    #   - SUM(contract-level) → double count → KPI sai
-    #
-    # Ví dụ sai:
-    #   Contract A: mac=ABC (laptop) + mac=DEF (phone) → total_devices=2
-    #   Contract B: mac=ABC (cùng laptop)               → total_devices=1
-    #   SUM = 3 → nhưng thực tế chỉ có 2 thiết bị (double count ABC)
-    #
-    # Ví dụ đúng (countDistinct trên raw bronze rows):
-    #   bronze_df tất cả rows → countDistinct("mac") = 2
-    #
-    # Cùng 1 thiết bị gắn nhiều contract → chỉ đếm 1 lần
+    platform_devices = df.groupBy("_load_date").agg(countDistinct("mac").alias("unique_devices"))
 
-    platform_devices = (
-        df.groupBy("_load_date")
-          .agg(countDistinct("mac").alias("unique_devices"))
-    )
+    duration_cols = [c for c in contract_stats.columns if c not in ("contract", "_load_date", "total_devices")]
 
-    # ───────────────────────────────────────────────────────────────
-    # E. Daily summary (platform-level — grain: ngày)
-    # ───────────────────────────────────────────────────────────────
-    #
-    # contract_stats giờ có nhiều rows (mỗi contract 1 row), ví dụ:
-    #   HNH579912 | 254 | 430 | 0 | 0 | 0 | 2
-    #   HUFD40665 | 1457| 0   | 0 | 0 | 0 | 1
-    #
-    # Tính platform-level KPIs từ tất cả contracts trong ngày:
-    #   - SUM tất cả duration columns → total_duration
-    #   - COUNT DISTINCT contract → active_contracts (= DAU)
-    #   - JOIN platform_devices → unique_devices
-    #   - total_duration / active_contracts → avg_session_duration
-
-    # Lấy tất cả duration columns (type columns từ pivot)
-    duration_cols = [c for c in contract_stats.columns
-                    if c not in ("contract", "_load_date", "total_devices")]
-
-    # Tổng tất cả duration → 1 row duy nhất cho ngày đó
     daily_summary = (
-        contract_stats.select(
-            *[col(c) for c in duration_cols],
-            col("contract"),
-            col("_load_date"),
-        )
+        contract_stats.select(*[col(c) for c in duration_cols], col("contract"), col("_load_date"))
         .groupBy("_load_date")
         .agg(
             spark_sum("Truyền Hình").alias("Truyền Hình"),
@@ -173,8 +59,158 @@ def aggregate(df: DataFrame, target_date: str) -> tuple:
         .withColumn("total_duration",
             col("Truyền Hình") + col("Phim Truyện") + col("Giải Trí")
             + col("Thiếu Nhi") + col("Thể Thao"))
-        .withColumn("avg_session_duration",
-            col("total_duration") / col("active_contracts"))
+        .withColumn("avg_session_duration", col("total_duration") / col("active_contracts"))
     )
 
     return contract_stats, daily_summary
+
+
+def calc_most_watch(contract_stats: DataFrame) -> DataFrame:
+    cat_map = {
+        "Giải Trí": "Relax",
+        "Phim Truyện": "Movie",
+        "Thiếu Nhi": "Child",
+        "Thể Thao": "Sport",
+        "Truyền Hình": "TV",
+    }
+    frames = []
+    for col_name, category in cat_map.items():
+        if col_name in contract_stats.columns:
+            frames.append(
+                contract_stats.select("contract", col(col_name).alias("total_duration"))
+                             .withColumn("category", lit(category))
+            )
+    unpivoted = frames[0]
+    for f in frames[1:]:
+        unpivoted = unpivoted.union(f)
+    unpivoted = unpivoted.withColumn("total_duration", coalesce(col("total_duration"), lit(0)))
+
+    window = Window.partitionBy("contract").orderBy(desc("total_duration"))
+    return (
+        unpivoted.withColumn("rank", rank().over(window))
+        .filter(col("rank") == 1)
+        .select("contract", col("category").alias("most_watch"))
+    )
+
+
+def calc_taste(contract_stats: DataFrame) -> DataFrame:
+    cat_map = {
+        "Giải Trí": "Relax",
+        "Phim Truyện": "Movie",
+        "Thiếu Nhi": "Child",
+        "Thể Thao": "Sport",
+        "Truyền Hình": "TV",
+    }
+    taste_cols = []
+    for col_name, label in cat_map.items():
+        if col_name in contract_stats.columns:
+            c = col(col_name)
+            taste_cols.append(when(c.isNotNull() & (c > 0), lit(label)).otherwise(lit(None)))
+    return (
+        contract_stats.withColumn("taste", concat_ws("-", *taste_cols))
+        .select("contract", col("taste"))
+    )
+
+
+def calc_type(contract_stats: DataFrame, target_date: str) -> DataFrame:
+    duration_cols = [c for c in contract_stats.columns
+                     if c not in ("contract", "_load_date", "total_devices")]
+    df = contract_stats.withColumn("total_duration",
+        sum(coalesce(col(c), lit(0)) for c in duration_cols))
+
+    q = df.approxQuantile("total_duration", [0.25, 0.75], 0.0)
+    q1, q3 = float(q[0]), float(q[1])
+
+    return (
+        df.withColumn("type",
+            when(col("total_duration") < q1, "Low")
+            .when(col("total_duration") > q3, "High")
+            .otherwise("Medium"))
+        .withColumn("_load_date", lit(target_date))
+        .select("contract", "_load_date", "total_duration", "type")
+    )
+
+
+def calc_activeness(spark, target_date: str) -> DataFrame:
+
+    blob_svc = get_blob_service()
+    local_tmp = "/tmp/silver_activeness"
+    remote_prefix = "_content/contract_stats/"
+
+    _os.makedirs(local_tmp, exist_ok=True)
+
+    download_blobs(blob_svc, "silver", remote_prefix, local_tmp)
+
+    try:
+        stats_df = spark.read.parquet(local_tmp)
+    except Exception as e:
+        if "AnalysisException" in str(type(e).__name__):
+            return spark.createDataFrame([], "contract string, activeness int, _load_date string")
+        raise
+
+    return (
+        stats_df.groupBy("contract")
+                .agg(countDistinct("_load_date").alias("activeness"))
+                .withColumn("_load_date", lit(target_date))
+    )
+
+
+def calc_clinginess(type_df: DataFrame, activeness_df: DataFrame, target_date: str) -> DataFrame:
+    base = type_df.select("contract", "type").join(activeness_df, on="contract", how="inner")
+
+    return (
+        base.withColumn("clinginess",
+            when((col("type") == "Low") & (col("activeness") <= 20), "Low")
+            .when((col("type") == "Low") & (col("activeness") > 20), "Medium")
+            .when((col("type") == "Medium") & (col("activeness") <= 10), "Low")
+            .when((col("type") == "Medium") & (col("activeness") > 10) & (col("activeness") <= 20), "Medium")
+            .when((col("type") == "Medium") & (col("activeness") > 20), "High")
+            .when((col("type") == "High") & (col("activeness") <= 10), "Medium")
+            .when((col("type") == "High") & (col("activeness") > 10), "High"))
+        .withColumn("_load_date", lit(target_date))
+        .select("contract", "_load_date", "type", "activeness", "clinginess")
+    )
+
+
+# SEARCH PIPELINE — enrich + aggregate
+
+def get_most_search(df: DataFrame, month_label: str) -> DataFrame:
+    counts = (
+        df.select("user_id", "keyword")
+          .filter(col("user_id").isNotNull() & col("keyword").isNotNull())
+          .groupBy("user_id", "keyword")
+          .agg(count("*").alias("times"))
+    )
+
+    w = W.partitionBy("user_id").orderBy(col("times").desc())
+
+    return (
+        counts.withColumn("rnk", rank().over(w))
+              .filter(col("rnk") == 1)
+              .select("user_id", col("keyword").alias(f"most_search_{month_label}"))
+    )
+
+
+def enrich_and_aggregate_search(bronze_df: DataFrame) -> DataFrame:
+
+    june_df = bronze_df.filter(substring("_load_date", 1, 7) == "2022-06")
+    july_df = bronze_df.filter(substring("_load_date", 1, 7) == "2022-07")
+
+    june_most = get_most_search(june_df, "june")
+    july_most = get_most_search(july_df, "july")
+
+    result = june_most.join(july_most, "user_id", "inner")
+
+    result = (
+        result
+        .withColumn("category_june", map_category(col("most_search_june")))
+        .withColumn("category_july", map_category(col("most_search_july")))
+        .withColumn("trending_type",
+                    when(col("category_june") == col("category_july"), "Unchanged")
+                    .otherwise("Changed"))
+        .withColumn("previous",
+                    when(col("trending_type") == "Unchanged", "Unchanged")
+                    .otherwise(concat_ws("; ", col("category_june"), col("category_july"))))
+    )
+
+    return result
