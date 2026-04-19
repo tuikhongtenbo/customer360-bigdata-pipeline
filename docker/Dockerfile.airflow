@@ -1,0 +1,29 @@
+FROM apache/airflow:2.9.3-python3.10
+
+USER root
+RUN apt-get update && apt-get install -y \
+    openjdk-17-jdk-headless \
+    git \
+    curl \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV DBT_PROJECT_DIR=/opt/airflow/dbt/customer360
+ENV DBT_PROFILES_DIR=/home/airflow/.dbt
+
+RUN mkdir -p /home/airflow/.dbt && \
+    ln -s /opt/airflow/dbt/customer360/profiles.yml /home/airflow/.dbt/profiles.yml
+
+RUN git config --global --add safe.directory /opt/airflow/dbt
+
+RUN python -m pip install \
+    pyspark==3.5.0 findspark \
+    azure-storage-blob python-dotenv \
+    duckdb \
+    dbt-synapse dbt-duckdb
