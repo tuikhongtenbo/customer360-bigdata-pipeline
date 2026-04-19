@@ -1,0 +1,25 @@
+version: 2
+
+sources:
+  - name: silver
+    schema: dbo
+    freshness: null
+    loaded_at_field: null
+    database: customer360_gold
+    tables:
+      - name: silver_contract_stats
+        identifier: silver_contract_stats
+      - name: silver_daily_summary
+        identifier: silver_daily_summary
+      - name: contract_most_watch
+        identifier: contract_most_watch
+      - name: contract_taste
+        identifier: contract_taste
+      - name: contract_type
+        identifier: contract_type
+      - name: contract_activeness
+        identifier: contract_activeness
+      - name: contract_clinginess
+        identifier: contract_clinginess
+      - name: search_trending
+        identifier: search_trending

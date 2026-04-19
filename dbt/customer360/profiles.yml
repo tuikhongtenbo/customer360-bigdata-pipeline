@@ -1,0 +1,21 @@
+customer360:
+  target: dev
+  outputs:
+    dev:
+      type: synapse
+      driver: ODBC Driver 17 for SQL Server
+      server: "{{ env_var('SYNAPSE_SERVER') }}"
+      database: customer360_gold
+      schema: gold
+      authentication: ActiveDirectoryServicePrincipal
+      serverless: true
+      use_legacy_views: false
+      tenant_id: "{{ env_var('AZURE_TENANT_ID') }}"
+      client_id: "{{ env_var('AZURE_CLIENT_ID') }}"
+      client_secret: "{{ env_var('AZURE_CLIENT_SECRET') }}"
+      encrypt: true
+      trust_cert: true
+
+    local:
+      type: duckdb
+      path: "{{ env_var('LOCAL_DUCKDB_PATH', '/opt/airflow/data/gold/customer360.duckdb') }}"

@@ -1,0 +1,21 @@
+name: customer360
+version: "1.0.0"
+config-version: 2
+
+profile: customer360
+
+vars:
+  silver_schema: dbo
+  gold_schema: gold
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+clean-targets: ["target", "dbt_modules"]
+
+models:
+  customer360:
+    gold:
+      +schema: gold
+      +materialized: view
