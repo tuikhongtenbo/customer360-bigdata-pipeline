@@ -22,14 +22,14 @@ def evaluate(df: DataFrame, rules: list, max_rejection_rate: float = 0.05):
     valid_mask = None
     for rule in rules:
         valid_mask = rule.predicate_col if valid_mask is None else valid_mask & rule.predicate_col
-    
+
     valid_df = df.filter(valid_mask)
     invalid_df = df.filter(~valid_mask)
-    
+
     total = df.count()
     invalid_n = invalid_df.count()
     rate = invalid_n / total if total > 0 else 0.0
-    
+
     report = {
         "total": total,
         "valid": total - invalid_n,

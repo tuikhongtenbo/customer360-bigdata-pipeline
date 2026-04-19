@@ -3,9 +3,10 @@ findspark.init()
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import lit, col, from_json
 from pyspark.sql.types import StructType, StructField, StringType, LongType
-from azure.storage.blob import BlobServiceClient
 import os
 from dotenv import load_dotenv
+
+from src.utils.azure_utils import get_blob_service, download_blobs, resolve_path
 
 load_dotenv("/opt/airflow/.env")
 LOCAL_TMP = "/tmp/bronze_tmp"
@@ -22,19 +23,29 @@ FULL_SCHEMA = StructType([
 ])
 
 
-def load_raw(target_date):
+def load_raw(target_date: str, data_type: str = "content"):
     os.makedirs(LOCAL_TMP, exist_ok=True)
-    local_file = f"{LOCAL_TMP}/raw_{target_date}.json"
-
-    conn_str  = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    blob_svc = get_blob_service()
     container = os.environ.get("AZURE_STORAGE_CONTAINER_RAW", "raw")
-    blob_name = f"raw/_load_date={target_date}/{target_date.replace('-', '')}.json"
 
-    blob_client = BlobServiceClient.from_connection_string(conn_str)
+    if data_type == "content":
+        return _load_raw_content(target_date, blob_svc, container)
+    elif data_type == "search":
+        return _load_raw_search(target_date, blob_svc, container)
+    else:
+        raise ValueError(f"Unknown data_type: {data_type}")
+
+
+def _load_raw_content(target_date, blob_svc, container):
+    local_file = f"{LOCAL_TMP}/raw_{target_date}.json"
+    blob_name = resolve_path("content", "raw", target_date).rstrip("/")
+    blob_name = f"{blob_name}/{target_date.replace('-', '')}.json"
+
+    os.makedirs(os.path.dirname(local_file), exist_ok=True)
     with open(local_file, "wb") as f:
-        blob_client.get_blob_client(container, blob_name).download_blob().readinto(f)
+        blob_svc.get_blob_client(container, blob_name).download_blob().readinto(f)
 
-    spark = SparkSession.builder.appName("bronze_load").getOrCreate()
+    spark = SparkSession.builder.appName("bronze_load_content").getOrCreate()
 
     raw_df = spark.read.text(local_file)
     parsed = raw_df.select(from_json(col("value"), FULL_SCHEMA).alias("data"))
@@ -49,3 +60,17 @@ def load_raw(target_date):
     )
 
     return df, spark, local_file
+
+
+def _load_raw_search(target_date, blob_svc, container):
+    local_dir = f"{LOCAL_TMP}/search/_load_date={target_date}"
+    os.makedirs(local_dir, exist_ok=True)
+
+    remote_prefix = resolve_path("search", "raw", target_date)
+    download_blobs(blob_svc, container, remote_prefix, local_dir)
+
+    spark = SparkSession.builder.appName("bronze_load_search").getOrCreate()
+    df = spark.read.parquet(local_dir)
+    df = df.withColumn("_load_date", lit(target_date))
+
+    return df, spark, local_dir
