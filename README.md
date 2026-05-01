@@ -27,24 +27,7 @@
 
 ---
 
-## 2. Setup Guide
-
-### Prerequisites
-
-- Python 3.10+
-- Docker & Docker Compose
-- Azure account (production)
-
-### Triggering Airflow Jobs
-
-1. Access the Airflow UI at `http://localhost:8080` (admin/admin).
-2. Unpause `dag_etl_customer360`.
-3. In trigger configurations, define custom historical dates (e.g. `2022-04-15` or `2022-06-05`). The system fan-outs data processing concurrently.
-   ![Airflow Job Runs](images/airflow_sucessfully_job_runs.png)
-
----
-
-## 3. Architecture & Tech Stack
+## 2. Architecture & Tech Stack
 
 ![High-Level Architecture](images/pipeline.png)
 
@@ -67,7 +50,7 @@
 
 ---
 
-## 4. Data Model
+## 3. Data Model
 
 ### Container Layout
 
@@ -105,7 +88,7 @@ Both Content and Search sources share standard containers (`raw`, `bronze`, `sil
 
 ---
 
-## 5. ETL Implementation
+## 4. ETL Implementation
 
 ### Workflow Snippets
 
@@ -131,6 +114,13 @@ def run_bronze(ds=None, data_type="content"):
 | `date_range`  | Fan-outs incrementals over a looped index         | Historical backfills          |
 | `full`        | Broad-wipes available partitions globally         | Disaster Recovery / Migration |
 
+### Triggering Airflow Jobs
+
+1. Access the Airflow UI at `http://localhost:8080` (admin/admin).
+2. Unpause `dag_etl_customer360`.
+3. In trigger configurations, define custom historical dates (e.g. `2022-04-15` or `2022-06-05`). The system fan-outs data processing concurrently.
+   ![Airflow Job Runs](images/airflow_sucessfully_job_runs.png)
+
 ### Data Quality (DQ) Thresholds
 
 - **Content Pipeline:** Gates metrics natively if `contract IS NULL`, `mac IS NULL`, or `total_duration < 0`. Hard fails if `0.05` (5%) rejection bounds are crossed.
@@ -138,7 +128,7 @@ def run_bronze(ds=None, data_type="content"):
 
 ---
 
-## 6. Power BI Dashboards
+## 5. Power BI Dashboards
 
 ### Content Analytics Dashboard
 
@@ -156,7 +146,7 @@ def run_bronze(ds=None, data_type="content"):
 
 ---
 
-## 7. Folder Structure
+## 6. Folder Structure
 
 ```text
 customer360-bigdata-pipeline/
