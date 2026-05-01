@@ -35,22 +35,6 @@
 - Docker & Docker Compose
 - Azure account (production)
 
-### Local Development & Execution
-
-```bash
-# 1. Clone and start core services
-git clone <your-repo>
-cd customer360-bigdata-pipeline
-docker compose -f docker/docker-compose.yml up -d
-
-# 2. Configure environment parameters
-cp .env.example .env
-# Edit .env file with your Azure Storage SAS/Connection Strings
-
-# 3. Provision Azure Blob Infrastructure
-# Ensure `raw`, `bronze`, and `silver` containers exist
-```
-
 ### Triggering Airflow Jobs
 
 1. Access the Airflow UI at `http://localhost:8080` (admin/admin).
