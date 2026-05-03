@@ -35,8 +35,8 @@ def _run_silver_content(ds):
     enriched = enrich(bronze_df)
     contract_stats, daily_summary = aggregate(enriched, date_str)
 
-    most_watch = calc_most_watch(contract_stats)
-    taste = calc_taste(contract_stats)
+    most_watch = calc_most_watch(contract_stats, date_str)
+    taste = calc_taste(contract_stats, date_str)
     contract_type = calc_type(contract_stats, date_str)
     activeness = calc_activeness(spark, date_str)
     clinginess = calc_clinginess(contract_type, activeness, date_str)

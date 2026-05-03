@@ -65,7 +65,7 @@ def aggregate(df: DataFrame, target_date: str) -> tuple:
     return contract_stats, daily_summary
 
 
-def calc_most_watch(contract_stats: DataFrame) -> DataFrame:
+def calc_most_watch(contract_stats: DataFrame, target_date: str) -> DataFrame:
     cat_map = {
         "Giải Trí": "Relax",
         "Phim Truyện": "Movie",
@@ -89,11 +89,12 @@ def calc_most_watch(contract_stats: DataFrame) -> DataFrame:
     return (
         unpivoted.withColumn("rank", rank().over(window))
         .filter(col("rank") == 1)
-        .select("contract", col("category").alias("most_watch"))
+        .withColumn("_load_date", lit(target_date))
+        .select("contract", col("category").alias("most_watch"), "_load_date")
     )
 
 
-def calc_taste(contract_stats: DataFrame) -> DataFrame:
+def calc_taste(contract_stats: DataFrame, target_date: str) -> DataFrame:
     cat_map = {
         "Giải Trí": "Relax",
         "Phim Truyện": "Movie",
@@ -108,7 +109,8 @@ def calc_taste(contract_stats: DataFrame) -> DataFrame:
             taste_cols.append(when(c.isNotNull() & (c > 0), lit(label)).otherwise(lit(None)))
     return (
         contract_stats.withColumn("taste", concat_ws("-", *taste_cols))
-        .select("contract", col("taste"))
+        .withColumn("_load_date", lit(target_date))
+        .select("contract", "taste", "_load_date")
     )
 
 
