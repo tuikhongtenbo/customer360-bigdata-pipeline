@@ -31,8 +31,6 @@ def run_gold(ds=None, data_type="content"):
         "--target", "dev",
         "--project-dir", DBT_PROJECT_DIR,
     ]
-    if data_type == "content" and date_str:
-        run_cmd.extend(["--vars", json.dumps({"target_date": date_str})])
 
     run_result = subprocess.run(
         run_cmd, cwd=DBT_PROJECT_DIR,
@@ -54,8 +52,6 @@ def run_gold(ds=None, data_type="content"):
         "--target", "dev",
         "--project-dir", DBT_PROJECT_DIR,
     ]
-    if data_type == "content" and date_str:
-        test_cmd.extend(["--vars", json.dumps({"target_date": date_str})])
 
     test_result = subprocess.run(
         test_cmd, cwd=DBT_PROJECT_DIR,

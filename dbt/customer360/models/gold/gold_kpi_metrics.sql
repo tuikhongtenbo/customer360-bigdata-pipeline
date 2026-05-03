@@ -13,6 +13,5 @@ SELECT
              + COALESCE([Thể Thao], 0)) AS FLOAT)
               / MAX(active_contracts)
     END AS avg_session_duration
-FROM dbo.silver_daily_summary  
-WHERE _load_date = '{{ var("target_date") }}'
+FROM dbo.silver_daily_summary
 GROUP BY _load_date
