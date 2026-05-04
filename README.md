@@ -141,10 +141,12 @@ def run_bronze(ds=None, data_type="content"):
 
 ### Search Trending Dashboard
 
-![Search Trending Dashboard](images/search_trending_dashboard.png)
+> 🔗 **Live Dashboard:** [View on Power BI Service](https://app.powerbi.com/reportEmbed?reportId=1f2e3a9b-22c4-4fd7-8942-47dc01de2456&autoAuth=true&ctid=6ac2ad06-692c-4663-b7af-a9ff2a866d0c)
 
-- **Evolution Visualization**: Traces structural categorical transitions between consecutive months mapping semantic intent shifts.
-- Provides deep-dives into Top keyword trends, Changed vs Unchanged loyalty splits, and keyword-to-category associations.
+![Search Trending Dashboard](images/search_dashboard.jpg)
+
+- **Intent Evolution**: Traces structural categorical transitions between June and July 2022 to map semantic intent shifts.
+- **Loyalty Analysis**: Provides deep-dives into Changed vs Unchanged loyalty splits and top trending keywords per month.
 
 ---
 
