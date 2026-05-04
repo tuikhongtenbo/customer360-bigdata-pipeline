@@ -130,12 +130,14 @@ def run_bronze(ds=None, data_type="content"):
 
 ## 5. Power BI Dashboards
 
+> 🔗 **Live Dashboard:** [View on Power BI Service](https://app.powerbi.com/reportEmbed?reportId=3d4041e4-1098-4b35-ab70-8f45b31b5441&autoAuth=true&ctid=6ac2ad06-692c-4663-b7af-a9ff2a866d0c)
+
 ### Content Analytics Dashboard
 
-![Content Analytics Dashboard](images/content_analytics_dashboard.png)
+![Content Analytics Dashboard](images/dax_content_main.pdf)
 
-- **KPI Metrics**: Active Contracts, Daily Analytics Users (DAU), System Avg Duration Sessions.
-- **Contract Segmentation Matrices**: Displays macro distributions representing Taste filters, active engagement limits, and calculated viewer clinginess typologies.
+- **KPI Metrics**: Active Contracts, Avg Session Duration, Unique Devices, Total Viewing Hours.
+- **Contract Segmentation**: Content Type Distribution, Daily Viewing Trend, Clinginess & Activity segments, and Taste profile matrix.
 
 ### Search Trending Dashboard
 
