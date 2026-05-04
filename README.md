@@ -134,7 +134,7 @@ def run_bronze(ds=None, data_type="content"):
 
 ### Content Analytics Dashboard
 
-![Content Analytics Dashboard](images/dax_content_main.pdf)
+![Content Analytics Dashboard](images/dax_content_main.jpg)
 
 - **KPI Metrics**: Active Contracts, Avg Session Duration, Unique Devices, Total Viewing Hours.
 - **Contract Segmentation**: Content Type Distribution, Daily Viewing Trend, Clinginess & Activity segments, and Taste profile matrix.
